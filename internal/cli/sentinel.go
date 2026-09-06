@@ -4,7 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -80,8 +83,7 @@ func sentinelCmd() *cobra.Command {
 		status     bool
 		stop       bool
 		managed    bool
-		fleetURL   string
-		fleetToken string
+		fo         fleetOptions
 	)
 
 	cmd := &cobra.Command{
@@ -141,10 +143,10 @@ against a Sentinel session with no separate inspection stack.`,
 			}
 
 			if background {
-				return startSentinelBackground(repoAbs, policyPath, policyPack, fleetURL, fleetToken)
+				return startSentinelBackground(repoAbs, policyPath, policyPack, fo)
 			}
 
-			return runSentinelForeground(repoAbs, policyPath, policyPack, managed, fleetURL, fleetToken)
+			return runSentinelForeground(repoAbs, policyPath, policyPack, managed, fo)
 		},
 	}
 
@@ -156,16 +158,19 @@ against a Sentinel session with no separate inspection stack.`,
 	cmd.Flags().BoolVar(&stop, "stop", false, "Stop the running Sentinel for --repo")
 	cmd.Flags().BoolVar(&managed, "managed", false, "Internal: run as the managed background sentinel")
 	_ = cmd.Flags().MarkHidden("managed")
-	cmd.Flags().StringVar(&fleetURL, "fleet", "", "Airlock Fleet control plane URL to enroll with and heartbeat to (optional; standalone if unset)")
-	cmd.Flags().StringVar(&fleetToken, "fleet-token", "", "Shared token for the fleet control plane, if it requires one")
+	cmd.Flags().StringVar(&fo.URL, "fleet", "", "Airlock Fleet control plane URL to enroll with and heartbeat to (optional; standalone if unset)")
+	cmd.Flags().StringVar(&fo.Token, "fleet-token", "", "Shared operator token for the fleet control plane, if it requires one")
+	cmd.Flags().StringVar(&fo.EnrollToken, "fleet-enroll-token", "", "One-time enrollment token from 'airlock fleet enroll-token create' (first enrollment only)")
+	cmd.Flags().StringVar(&fo.PublicKey, "fleet-pubkey", "", "Pin the control plane's policy signing key explicitly (hex key, or a path to a file containing it)")
+	cmd.Flags().StringVar(&fo.CACert, "fleet-ca", "", "PEM bundle to trust for an https:// control plane behind a private CA")
 	return cmd
 }
 
 // runSentinelForeground resolves policy, takes the session-start checkpoint,
 // seeds and starts the recorder against the real repo, and blocks until a
 // stop signal (Ctrl-C, SIGTERM, or `airlock sentinel --stop`) arrives.
-func runSentinelForeground(repoAbs, policyPath, policyPack string, managed bool, fleetURL, fleetToken string) error {
-	sess, err := startSentinelSession(repoAbs, policyPath, policyPack, managed, fleetURL, fleetToken)
+func runSentinelForeground(repoAbs, policyPath, policyPack string, managed bool, fo fleetOptions) error {
+	sess, err := startSentinelSession(repoAbs, policyPath, policyPack, managed, fo)
 	if err != nil {
 		return err
 	}
@@ -208,7 +213,8 @@ func runSentinelForeground(repoAbs, policyPath, policyPack string, managed bool,
 // session deterministically — perform filesystem operations, assert on
 // evidence, then call sess.shutdown() directly — without needing to send a
 // real signal to the test process.
-func startSentinelSession(repoAbs, policyPath, policyPack string, managed bool, fleetURL, fleetToken string) (*sentinelSession, error) {
+func startSentinelSession(repoAbs, policyPath, policyPack string, managed bool, fo fleetOptions) (*sentinelSession, error) {
+	fleetURL := strings.TrimSpace(fo.URL)
 	resolvedPolicyPath := policyPath
 	if !filepath.IsAbs(resolvedPolicyPath) {
 		resolvedPolicyPath = filepath.Join(repoAbs, resolvedPolicyPath)
@@ -241,12 +247,36 @@ func startSentinelSession(repoAbs, policyPath, policyPack string, managed bool, 
 	// managed Sentinel that has never yet reconciled anything falls back to
 	// local airlock.yaml, exactly like a standalone Sentinel, until its
 	// first successful reconciliation establishes an LKG.
-	var fleetPolicyRef fleet.PolicyRef
+	//
+	// The pinned signing key is loaded first (Prompt 14B), because the
+	// last-known-good policy is re-verified against it before being trusted:
+	// a Sentinel restarting while its control plane is unreachable still
+	// proves to itself that the policy it is about to enforce is the signed
+	// one it accepted, not something that has since been edited on disk.
+	var (
+		fleetPolicyRef fleet.PolicyRef
+		trust          fleet.TrustStore
+		maxAccepted    = map[string]int{}
+		signatureState string
+		signerKeyID    string
+		identityState  = "UNAUTHENTICATED"
+	)
 	if strings.TrimSpace(fleetURL) != "" {
-		if lkgCfg, ref, ok := loadFleetLKG(repoAbs); ok {
-			cfg = lkgCfg
-			fleetPolicyRef = ref
-			fmt.Printf("Restored last-known-good Fleet policy: %s v%d (hash %s)\n", ref.PolicyID, ref.Version, ref.Hash)
+		if cred, ok := loadFleetCredential(repoAbs); ok {
+			trust = fleet.Trust(cred.SigningKeyID, cred.SigningPublicKey)
+			identityState = "AUTHENTICATED"
+			signerKeyID = cred.SigningKeyID
+		}
+		if lkg, ok := loadFleetLKG(repoAbs, trust); ok {
+			cfg = lkg.cfg
+			fleetPolicyRef = lkg.ref
+			maxAccepted = lkg.maxAccepted
+			signatureState = lkg.signatureState
+			if lkg.signerKeyID != "" {
+				signerKeyID = lkg.signerKeyID
+			}
+			fmt.Printf("Restored last-known-good Fleet policy: %s v%d (hash %s, signature %s)\n",
+				lkg.ref.PolicyID, lkg.ref.Version, lkg.ref.Hash, strings.ToLower(lkg.signatureState))
 		}
 	}
 
@@ -288,6 +318,11 @@ func startSentinelSession(repoAbs, policyPath, policyPack string, managed bool, 
 		policyPack:     policyPack,
 		cfg:            cfg,
 		fleetPolicyRef: fleetPolicyRef,
+		trust:          trust,
+		maxAccepted:    maxAccepted,
+		signatureState: signatureState,
+		signerKeyID:    signerKeyID,
+		identityState:  identityState,
 		logger:         logger,
 		startedAt:      startedAt,
 	}
@@ -324,12 +359,42 @@ func startSentinelSession(repoAbs, policyPath, policyPack string, managed bool, 
 		return nil, err
 	}
 
-	if strings.TrimSpace(fleetURL) != "" {
-		sess.startFleet(fleetURL, fleetToken)
+	if fleetURL != "" {
+		sess.startFleet(fo)
 	}
 
 	return sess, nil
 }
+
+// fleetOptions bundles everything a Sentinel needs to talk to a Fleet control
+// plane. It replaced a growing list of positional string parameters once
+// Prompt 14B added enrollment tokens, key pinning, and private-CA trust --
+// five adjacent strings threaded through three functions is exactly how a
+// caller ends up silently passing a token where a URL belongs.
+type fleetOptions struct {
+	// URL is the control plane address. Empty means standalone: no fleet
+	// code runs at all.
+	URL string
+
+	// Token is the optional shared operator token from Prompt 14. It is not
+	// a Sentinel identity -- see EnrollToken.
+	Token string
+
+	// EnrollToken is a one-time, operator-issued enrollment token, presented
+	// only until this Sentinel holds a durable credential.
+	EnrollToken string
+
+	// PublicKey optionally pins the control plane's policy-signing key
+	// explicitly (hex, or a path to a file containing it), instead of
+	// accepting the one advertised at enrollment.
+	PublicKey string
+
+	// CACert optionally adds a PEM trust anchor for a self-hosted control
+	// plane behind a private CA or self-signed certificate.
+	CACert string
+}
+
+func (o fleetOptions) enabled() bool { return strings.TrimSpace(o.URL) != "" }
 
 // sentinelSession bundles the state a running Sentinel needs to keep its
 // evidence (manifest, digest, report, index) current and to finalize
@@ -361,15 +426,109 @@ type sentinelSession struct {
 	cfg            *policy.Config
 	fleetPolicyRef fleet.PolicyRef
 
+	// Trust state (Prompt 14B), guarded by the same policyMu as the policy it
+	// describes, since the two always change together.
+	//
+	//   trust           the pinned control-plane signing key(s); empty means
+	//                   no signing relationship has ever been established
+	//   maxAccepted     anti-downgrade high-water mark, policy id -> highest
+	//                   version ever accepted
+	//   lastRejectedRef the last desired ref refused on trust grounds, so a
+	//                   deterministic refusal is not retried every heartbeat.
+	//                   Latched together with the rollback authorization that
+	//                   was (or was not) presented with it -- see
+	//                   lastRejectedGrantSig
+	//   identityState   AUTHENTICATED / UNAUTHENTICATED / REVOKED
+	//   signatureState  how the running policy was verified: VERIFIED /
+	//                   UNSIGNED / "" (not Fleet-managed)
+	trust           fleet.TrustStore
+	maxAccepted     map[string]int
+	lastRejectedRef fleet.PolicyRef
+	// lastRejectedGrantSig is the rollback authorization that accompanied the
+	// latched rejection (empty if there was none). The latch keys on it as
+	// well as on the ref, because an operator issuing a signed rollback grant
+	// for a ref this Sentinel already refused is precisely the case that must
+	// be retried -- the inputs changed, so the outcome may too.
+	lastRejectedGrantSig string
+	identityState        string
+	signatureState       string
+	signerKeyID          string
+	// fleetConnected tracks whether the control plane was reachable on the
+	// last attempt. It is reported locally but never conflated with identity:
+	// "cannot reach the control plane" and "my credential was revoked" are
+	// different states with different meanings.
+	fleetConnected bool
+
 	// Fleet reporting (optional; nil/zero when --fleet is unset). See
 	// startFleet and fleetLoop below. sentinelID is the durable identity for
 	// "this Sentinel governing this repo" -- distinct from sessionID, which
 	// is fresh every restart. See internal/fleet/identity.go.
 	sentinelID     string
 	fleetMachineID string
+	fleetOpts      fleetOptions
 	fleetClient    *fleet.Client
 	fleetStopCh    chan struct{}
 	fleetDone      chan struct{}
+
+	// outbox durably buffers metadata-only reports while the control plane is
+	// unreachable; reportCursor is this session's position in its own event
+	// log, and is touched only from the fleet goroutine.
+	outbox       *fleet.Outbox
+	reportCursor int
+}
+
+func (s *sentinelSession) getTrust() fleet.TrustStore {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	return s.trust
+}
+
+func (s *sentinelSession) getIdentityState() string {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	if s.identityState == "" {
+		return "UNAUTHENTICATED"
+	}
+	return s.identityState
+}
+
+func (s *sentinelSession) setIdentityState(state string) {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	s.identityState = state
+}
+
+func (s *sentinelSession) getSignatureState() string {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	return s.signatureState
+}
+
+func (s *sentinelSession) setSignatureState(state, keyID string) {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	s.signatureState = state
+	if keyID != "" {
+		s.signerKeyID = keyID
+	}
+}
+
+func (s *sentinelSession) setConnected(connected bool) {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	s.fleetConnected = connected
+}
+
+func (s *sentinelSession) isConnected() bool {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	return s.fleetConnected
+}
+
+func (s *sentinelSession) getSignerKeyID() string {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	return s.signerKeyID
 }
 
 func (s *sentinelSession) getCfg() *policy.Config {
@@ -478,7 +637,7 @@ func (s *sentinelSession) shutdown() {
 // directory for the machine identity file) only disables fleet reporting
 // for this run -- it never fails session startup, since Sentinel must work
 // standalone regardless of fleet configuration or fleet reachability.
-func (s *sentinelSession) startFleet(fleetURL, fleetToken string) {
+func (s *sentinelSession) startFleet(fo fleetOptions) {
 	machineID, err := fleet.MachineID()
 	if err != nil {
 		fmt.Printf("WARN: fleet reporting disabled: could not establish machine identity: %v\n", err)
@@ -491,10 +650,85 @@ func (s *sentinelSession) startFleet(fleetURL, fleetToken string) {
 	}
 	s.sentinelID = sentinelID
 	s.fleetMachineID = machineID
-	s.fleetClient = fleet.NewClient(fleetURL, fleetToken)
+	s.fleetOpts = fo
+	s.fleetClient = fleet.NewClient(fo.URL, fo.Token)
+
+	if strings.TrimSpace(fo.CACert) != "" {
+		if err := s.fleetClient.SetRootCA(fo.CACert); err != nil {
+			fmt.Printf("WARN: fleet reporting disabled: %v\n", err)
+			s.fleetClient = nil
+			return
+		}
+	}
+	// An explicitly supplied key is pinned before the first request, so this
+	// Sentinel never even briefly trusts whatever the network hands it.
+	if strings.TrimSpace(fo.PublicKey) != "" {
+		keyID, hexKey, err := resolvePinnedPublicKey(fo.PublicKey)
+		if err != nil {
+			fmt.Printf("WARN: fleet reporting disabled: %v\n", err)
+			s.fleetClient = nil
+			return
+		}
+		s.policyMu.Lock()
+		s.trust = fleet.Trust(keyID, hexKey)
+		s.signerKeyID = keyID
+		s.policyMu.Unlock()
+	}
+
+	// A previously-issued credential makes this Sentinel authenticated from
+	// its very first request after a restart -- no re-enrollment, and no
+	// window where it speaks unauthenticated.
+	if cred, ok := loadFleetCredential(s.repoAbs); ok {
+		s.fleetClient.SetCredential(cred.Credential)
+		s.setIdentityState("AUTHENTICATED")
+	}
+	s.warnOnInsecureTransport()
+
+	if outbox, err := fleet.OpenOutbox(fleetOutboxPath(s.repoAbs)); err == nil {
+		s.outbox = outbox
+	} else {
+		fmt.Printf("WARN: fleet report buffering disabled: %v (heartbeats and enforcement are unaffected)\n", err)
+	}
+
 	s.fleetStopCh = make(chan struct{})
 	s.fleetDone = make(chan struct{})
 	go s.fleetLoop()
+}
+
+// warnOnInsecureTransport states the transport posture plainly instead of
+// letting a plaintext deployment pass unnoticed.
+//
+// Bearer credentials over plaintext HTTP to a remote host are not secure, and
+// this code does not pretend otherwise: loopback HTTP is a supported
+// development posture, anything else without TLS gets told what it is. Real
+// deployments point --fleet at an https:// URL (see `airlock fleet serve
+// --tls-cert/--tls-key`, or a TLS-terminating proxy).
+func (s *sentinelSession) warnOnInsecureTransport() {
+	if s.fleetClient == nil || s.fleetClient.UsesTLS() {
+		return
+	}
+	host := s.fleetClient.BaseURL()
+	if isLoopbackFleetURL(host) {
+		return
+	}
+	fmt.Printf("WARN: fleet control plane %s uses plaintext HTTP to a non-loopback host.\n", host)
+	fmt.Printf("      Credentials and reports will cross the network unencrypted and unauthenticated in transit.\n")
+	fmt.Printf("      Use an https:// URL for anything but local development.\n")
+}
+
+func isLoopbackFleetURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // stopFleet signals the fleet goroutine to exit and waits briefly for it, so
@@ -524,28 +758,138 @@ func (s *sentinelSession) stopFleet() {
 // enforcement.
 func (s *sentinelSession) fleetLoop() {
 	defer close(s.fleetDone)
+	// Publish local trust status before the enrollment burst, not after it.
+	// The burst backs off up to tens of seconds against an unreachable
+	// control plane, and during exactly that window someone is likely to ask
+	// this machine what it is enforcing -- they should get this session's
+	// answer, not the previous one's, and a first-ever run should not have no
+	// answer at all.
+	s.writeFleetStatus("")
 	enrolled := s.fleetTryEnroll()
+	s.setConnected(enrolled)
+	s.writeFleetStatus("")
 	ticker := time.NewTicker(fleetHeartbeatInterval())
 	defer ticker.Stop()
 	for {
 		select {
 		case <-s.fleetStopCh:
+			// Collect one last time so activity from the final moments of a
+			// session is buffered durably even if there is no time to upload
+			// it -- the next session flushes it.
+			s.collectReports()
 			return
 		case <-ticker.C:
+			// Buffering happens first and unconditionally: what a Sentinel
+			// observed is recorded locally whether or not anything can be
+			// reached right now.
+			s.collectReports()
 			if !enrolled {
-				if err := s.fleetClient.Enroll(s.buildEnrollRequest()); err != nil {
-					fmt.Printf("WARN: fleet enrollment retry failed: %v (still governing %s locally)\n", err, s.repoAbs)
+				if _, err := s.enrollOnce(); err != nil {
+					s.noteFleetError(err)
+					s.setConnected(false)
+					s.writeFleetStatus(err.Error())
 					continue
 				}
 				enrolled = true
 			}
 			resp, err := s.fleetClient.Heartbeat(s.buildHeartbeatRequest())
 			if err != nil {
-				fmt.Printf("WARN: fleet heartbeat failed: %v (continuing local governance; retrying next interval)\n", err)
+				s.noteFleetError(err)
+				// Refresh local status on the failure path too: an outage is
+				// precisely when someone runs `airlock sentinel --status` to
+				// ask what this machine is still enforcing and how much it has
+				// buffered. Leaving it frozen at the last successful heartbeat
+				// would answer that question with stale information.
+				s.setConnected(false)
+				s.writeFleetStatus(err.Error())
 				continue
 			}
+			s.setConnected(true)
+			if s.getIdentityState() == "REVOKED" {
+				// Reinstated: the control plane is accepting this credential
+				// again.
+				s.setIdentityState("AUTHENTICATED")
+				fmt.Println("Fleet credential accepted again; fleet participation resumed.")
+			}
+			s.flushReports()
 			s.reconcileFleetPolicy(resp)
+			s.writeFleetStatus("")
 		}
+	}
+}
+
+// enrollOnce performs one enrollment attempt and processes its response:
+// storing a newly-issued credential and pinning the control plane's signing
+// key the first time one is seen.
+func (s *sentinelSession) enrollOnce() (fleet.EnrollResponse, error) {
+	resp, err := s.fleetClient.Enroll(s.buildEnrollRequest())
+	if err != nil {
+		return resp, err
+	}
+	s.acceptEnrollResponse(resp)
+	return resp, nil
+}
+
+// acceptEnrollResponse persists whatever trust material an enrollment
+// returned.
+//
+// Key pinning is deliberately one-way. The first key seen -- in the exchange
+// an operator authorized with an out-of-band enrollment token -- is stored and
+// used forever after. A later response advertising a different key is refused
+// and reported, not adopted: otherwise anyone who took over the control
+// plane's address could re-point an established Sentinel at their own signing
+// key, and every other check in this file would then be verifying signatures
+// against the attacker's key.
+func (s *sentinelSession) acceptEnrollResponse(resp fleet.EnrollResponse) {
+	if strings.TrimSpace(resp.Credential) != "" {
+		cred := fleetCredentialFile{
+			SentinelID:       s.sentinelID,
+			FleetURL:         s.fleetClient.BaseURL(),
+			Credential:       resp.Credential,
+			SigningKeyID:     resp.SigningKeyID,
+			SigningPublicKey: resp.SigningPublicKey,
+			EnrolledAt:       time.Now().UTC(),
+		}
+		if err := saveFleetCredential(s.repoAbs, cred); err != nil {
+			fmt.Printf("WARN: could not persist fleet credential: %v (this Sentinel will need to re-enroll after a restart)\n", err)
+		}
+		s.fleetClient.SetCredential(resp.Credential)
+		s.setIdentityState("AUTHENTICATED")
+		fmt.Printf("Enrolled with Fleet control plane; credential stored at %s\n", fleetCredentialPath(s.repoAbs))
+	}
+
+	if strings.TrimSpace(resp.SigningKeyID) == "" {
+		return
+	}
+	current := s.getTrust()
+	if current.Empty() {
+		s.policyMu.Lock()
+		s.trust = fleet.Trust(resp.SigningKeyID, resp.SigningPublicKey)
+		s.signerKeyID = resp.SigningKeyID
+		s.policyMu.Unlock()
+		fmt.Printf("Pinned Fleet policy signing key %s\n", resp.SigningKeyID)
+		s.persistPinnedKey(resp)
+		return
+	}
+	if _, known := current.Keys[resp.SigningKeyID]; !known {
+		fmt.Printf("WARN: control plane advertised policy signing key %s, but this Sentinel has pinned a different key.\n", resp.SigningKeyID)
+		fmt.Printf("      Refusing to adopt it. Policy signed by the new key will be REJECTED and the last-known-good\n")
+		fmt.Printf("      policy stays in force. If this is an intentional key rotation, revoke and re-enroll this Sentinel.\n")
+	}
+}
+
+// persistPinnedKey records a newly-pinned key alongside an existing
+// credential, for the case where the key was advertised on a later enrollment
+// than the one that issued the credential.
+func (s *sentinelSession) persistPinnedKey(resp fleet.EnrollResponse) {
+	cred, ok := loadFleetCredential(s.repoAbs)
+	if !ok || cred.SigningKeyID == resp.SigningKeyID {
+		return
+	}
+	cred.SigningKeyID = resp.SigningKeyID
+	cred.SigningPublicKey = resp.SigningPublicKey
+	if err := saveFleetCredential(s.repoAbs, cred); err != nil {
+		fmt.Printf("WARN: could not persist pinned signing key: %v\n", err)
 	}
 }
 
@@ -557,10 +901,10 @@ func (s *sentinelSession) fleetLoop() {
 func (s *sentinelSession) fleetTryEnroll() bool {
 	backoff := fleetEnrollBackoffBase()
 	for attempt := 0; attempt < fleet.MaxEnrollAttempts; attempt++ {
-		if err := s.fleetClient.Enroll(s.buildEnrollRequest()); err == nil {
+		if _, err := s.enrollOnce(); err == nil {
 			return true
 		} else if attempt == 0 {
-			fmt.Printf("WARN: fleet control plane unreachable (%v); Sentinel continues local governance and will keep retrying enrollment.\n", err)
+			fmt.Printf("WARN: fleet enrollment did not succeed (%v); Sentinel continues local governance and will keep retrying.\n", err)
 		}
 		select {
 		case <-time.After(backoff):
@@ -588,7 +932,21 @@ func (s *sentinelSession) buildEnrollRequest() fleet.EnrollRequest {
 		PolicyID:        policyID,
 		PolicyVersion:   policyVersion,
 		PolicyHash:      policyHash,
+		// The enrollment token is presented only while this Sentinel has no
+		// credential of its own; once one is issued, it is never sent again.
+		EnrollToken: s.pendingEnrollToken(),
 	}
+}
+
+// pendingEnrollToken returns the one-time enrollment token, but only if this
+// Sentinel does not already hold a credential -- so a configured token is not
+// needlessly re-presented (and re-exposed) on every restart of an
+// already-enrolled Sentinel.
+func (s *sentinelSession) pendingEnrollToken() string {
+	if s.fleetClient != nil && s.fleetClient.HasCredential() {
+		return ""
+	}
+	return strings.TrimSpace(s.fleetOpts.EnrollToken)
 }
 
 func (s *sentinelSession) buildHeartbeatRequest() fleet.HeartbeatRequest {
@@ -608,7 +966,17 @@ func (s *sentinelSession) buildHeartbeatRequest() fleet.HeartbeatRequest {
 		DenyCount:         deny,
 		RevertedCount:     reverted,
 		RevertFailedCount: revertFailed,
+		SignatureState:    s.getSignatureState(),
+		SignerKeyID:       s.getSignerKeyID(),
+		BufferedReports:   s.bufferedReportCount(),
 	}
+}
+
+func (s *sentinelSession) bufferedReportCount() int {
+	if s.outbox == nil {
+		return 0
+	}
+	return s.outbox.Len()
 }
 
 // policyIdentity derives policy_id/policy_version/policy_hash from what this
@@ -676,25 +1044,30 @@ func governanceCounters(evs []events.Event) (allow, deny, reverted, revertFailed
 	return allow, deny, reverted, revertFailed, lastEventAt
 }
 
-// --- Fleet policy reconciliation (Prompt 14A) -------------------------------
+// --- Fleet policy reconciliation and trust (Prompts 14A / 14B) --------------
 //
-// A heartbeat response carries the control plane's desired policy, if one
-// is assigned (fleet.HeartbeatResponse). reconcileFleetPolicy is what turns
-// "desired differs from actual" into a real, local policy swap -- entirely
-// on the fleet goroutine, never blocking or being blocked by the recorder.
-// The only interaction with live enforcement is the single, atomic
-// Recorder.SetPolicy call once a fetched policy has already been fully
-// fetched, integrity-checked, and durably installed -- so a slow or failing
-// reconciliation attempt can never leave the recorder in a half-updated
-// state, and can never delay a filesystem decision that's already in
-// flight.
+// A heartbeat response carries the control plane's desired policy, if one is
+// assigned (fleet.HeartbeatResponse). reconcileFleetPolicy is what turns
+// "desired differs from actual" into a real, local policy swap -- entirely on
+// the fleet goroutine, never blocking or being blocked by the recorder. The
+// only interaction with live enforcement is the single, atomic
+// Recorder.SetPolicy call, made only after a fetched policy has been fully
+// fetched, integrity-checked, signature-verified, downgrade-checked, and
+// durably installed -- so a slow, failing, or untrusted reconciliation
+// attempt can never leave the recorder in a half-updated state, and can never
+// delay a filesystem decision that is already in flight.
+//
+// The core invariant on this side: a Sentinel does not trust the control
+// plane merely because something answered an HTTP request. Everything below
+// is verification of what came back, not of the fact that something came
+// back.
 
 // reconcileFleetPolicy compares resp's desired policy against what this
-// session currently enforces and, only if they differ, fetches, validates,
-// and atomically installs the new version. An empty DesiredPolicyID means
-// "not (or no longer) Fleet-policy-managed" -- Sentinel keeps enforcing
-// whatever it already has rather than treating a missing assignment as
-// "clear my policy."
+// session currently enforces and, only if they differ, fetches, verifies, and
+// atomically installs the new version. An empty DesiredPolicyID means "not
+// (or no longer) Fleet-policy-managed" -- Sentinel keeps enforcing whatever
+// it already has rather than treating a missing assignment as "clear my
+// policy."
 func (s *sentinelSession) reconcileFleetPolicy(resp fleet.HeartbeatResponse) {
 	if resp.DesiredPolicyID == "" {
 		return
@@ -703,10 +1076,26 @@ func (s *sentinelSession) reconcileFleetPolicy(resp fleet.HeartbeatResponse) {
 	if s.getFleetPolicyRef().Equal(desired) {
 		return // already in sync; do not re-fetch/re-apply identical desired state
 	}
+	// A desired ref this Sentinel has already rejected on trust grounds is
+	// not retried: a bad signature will not become valid on the next tick,
+	// and re-fetching it every heartbeat would be noise. Only deterministic
+	// trust failures are latched this way -- transient fetch failures are
+	// always retried (see failReconcile).
+	//
+	// The latch includes the rollback authorization presented with the ref,
+	// so an operator who responds to a DOWNGRADE_REJECTED by issuing a signed
+	// grant for that same version gets a fresh attempt rather than silence.
+	grantSig := ""
+	if resp.RollbackGrant != nil {
+		grantSig = resp.RollbackGrant.Signature
+	}
+	if s.alreadyRejected(desired, grantSig) {
+		return
+	}
 
 	// A real, observable "actively working on it" window -- reported before
 	// the network fetch, not fabricated after the fact.
-	s.reportReconcileStatus("RECONCILING", "", desired.Hash)
+	s.reportReconcileStatus(fleet.ReconcileInProcess, "", desired.Hash)
 
 	pv, err := s.fleetClient.GetPolicyVersion(desired.PolicyID, desired.Version)
 	if err != nil {
@@ -714,130 +1103,339 @@ func (s *sentinelSession) reconcileFleetPolicy(resp fleet.HeartbeatResponse) {
 		return
 	}
 	if pv.Hash != desired.Hash {
-		s.failReconcile(desired, fmt.Sprintf("fetched content hash %s does not match desired hash %s -- refusing to apply", pv.Hash, desired.Hash))
+		s.rejectReconcile(fleet.ReconcileFailed, desired, grantSig, fmt.Sprintf("fetched content hash %s does not match desired hash %s -- refusing to apply", pv.Hash, desired.Hash))
 		return
 	}
-	hash, newCfg, err := fleet.ComputePolicyHash(pv.YAML)
+	// Recompute both digests from the fetched bytes rather than trusting any
+	// field the control plane sent. Everything downstream -- the signature
+	// check and the rollback binding -- is checked against these locally
+	// derived values.
+	digest, short, newCfg, err := fleet.ComputePolicyDigest(pv.YAML)
 	if err != nil {
-		s.failReconcile(desired, fmt.Sprintf("fetched policy failed to parse: %v", err))
+		s.rejectReconcile(fleet.ReconcileFailed, desired, grantSig, fmt.Sprintf("fetched policy failed to parse: %v", err))
 		return
 	}
-	if hash != desired.Hash {
-		// Unreachable in practice given the check above, but a policy swap
-		// is consequential enough not to trust a single comparison: recompute
-		// independently before ever installing.
-		s.failReconcile(desired, "recomputed hash does not match desired hash -- refusing to apply")
+	if short != desired.Hash {
+		s.rejectReconcile(fleet.ReconcileFailed, desired, grantSig, "recomputed hash does not match desired hash -- refusing to apply")
+		return
+	}
+	if pv.Digest != "" && pv.Digest != digest {
+		s.rejectReconcile(fleet.ReconcileFailed, desired, grantSig, "recomputed digest does not match the digest the control plane published -- refusing to apply")
+		return
+	}
+	pv.Digest = digest
+
+	if err := s.verifyFleetPolicy(pv); err != nil {
+		s.rejectReconcile(fleet.SignatureInvalid, desired, grantSig, err.Error())
+		return
+	}
+	if err := s.checkDowngrade(desired, digest, resp.RollbackGrant); err != nil {
+		s.rejectReconcile(fleet.DowngradeRejected, desired, grantSig, err.Error())
 		return
 	}
 
-	if err := installFleetPolicy(s.repoAbs, pv.YAML, desired); err != nil {
+	maxAccepted := s.acceptedVersions(desired)
+	if err := installFleetPolicy(s.repoAbs, pv, maxAccepted); err != nil {
 		s.failReconcile(desired, fmt.Sprintf("could not install policy atomically: %v", err))
 		return
 	}
 
-	s.setFleetPolicyRef(desired)
-	s.setCfg(newCfg)
-	s.rec.SetPolicy(newCfg)
-	fmt.Printf("Fleet policy reconciled: %s v%d (hash %s) now active\n", desired.PolicyID, desired.Version, desired.Hash)
+	s.applyFleetPolicy(desired, newCfg, pv, maxAccepted)
+	fmt.Printf("Fleet policy reconciled: %s v%d (hash %s, %s) now active\n",
+		desired.PolicyID, desired.Version, desired.Hash, strings.ToLower(s.getSignatureState()))
+	s.bufferReport(fleet.ReportPolicyApplied, time.Now().UTC(), "",
+		fmt.Sprintf("applied %s v%d (%s)", desired.PolicyID, desired.Version, strings.ToLower(s.getSignatureState())))
+	s.writeFleetStatus("")
 	// Report success immediately rather than waiting for the next regular
-	// heartbeat tick (up to a full DefaultHeartbeatInterval later): the
-	// control plane's IN_SYNC display should catch up to real enforcement
-	// promptly, not lag it. buildHeartbeatRequest already reflects the new
-	// fleetPolicyRef (set just above), so this is an ordinary heartbeat --
-	// no special reconcile fields needed; best-effort like every other
-	// fleet call.
+	// heartbeat tick (up to a full heartbeat interval later): the control
+	// plane's IN_SYNC display should catch up to real enforcement promptly,
+	// not lag it. buildHeartbeatRequest already reflects the new
+	// fleetPolicyRef, so this is an ordinary heartbeat -- best-effort like
+	// every other fleet call.
 	if _, err := s.fleetClient.Heartbeat(s.buildHeartbeatRequest()); err != nil {
 		fmt.Printf("WARN: fleet post-reconcile heartbeat failed: %v (will report as usual on the next interval)\n", err)
 	}
 }
 
+// verifyFleetPolicy is the signature gate.
+//
+// If this Sentinel has pinned a control-plane signing key, a policy MUST be
+// signed by it -- unsigned or differently-signed content is refused. If no
+// key has ever been pinned (a control plane that does not sign policy, i.e.
+// the pre-14B configuration), the policy is applied with the 14A integrity
+// checks alone and loudly labeled UNSIGNED, so the weaker posture is visible
+// rather than implied.
+//
+// The direction of that rule matters: trust only ever ratchets up. A Sentinel
+// that has established a signing relationship cannot be talked back down to
+// accepting unsigned policy by a control plane that simply stops signing.
+func (s *sentinelSession) verifyFleetPolicy(pv fleet.PolicyVersion) error {
+	trust := s.getTrust()
+	if trust.Empty() {
+		s.setSignatureState("UNSIGNED", "")
+		fmt.Printf("WARN: applying UNSIGNED Fleet policy %s v%d -- this control plane advertises no signing key\n", pv.PolicyID, pv.Version)
+		return nil
+	}
+	if err := fleet.VerifyPolicyVersion(pv, trust); err != nil {
+		return fmt.Errorf("policy signature rejected: %w", err)
+	}
+	s.setSignatureState("VERIFIED", pv.Issuer)
+	return nil
+}
+
+// checkDowngrade enforces the anti-downgrade rule: a Sentinel never moves to
+// a version older than the highest it has already accepted for that policy,
+// unless the control plane presents a valid signed RollbackGrant for exactly
+// this Sentinel, policy, version, and content digest.
+//
+// The grant -- not a flag, not a timestamp -- is what authorizes the move.
+// An attacker able to rewrite heartbeat responses can set any field they
+// like; they cannot produce a signature over one.
+func (s *sentinelSession) checkDowngrade(desired fleet.PolicyRef, digest string, grant *fleet.RollbackGrant) error {
+	highest := s.highestAccepted(desired.PolicyID)
+	if desired.Version >= highest {
+		return nil
+	}
+	trust := s.getTrust()
+	if trust.Empty() {
+		return fmt.Errorf("refusing to move %s from v%d back to v%d: rollback requires a signed authorization and this Sentinel trusts no signing key",
+			desired.PolicyID, highest, desired.Version)
+	}
+	if err := fleet.VerifyRollbackGrant(grant, trust, s.sentinelID, desired, digest, time.Now().UTC()); err != nil {
+		return fmt.Errorf("refusing to move %s from v%d back to v%d: %v", desired.PolicyID, highest, desired.Version, err)
+	}
+	fmt.Printf("Fleet rollback authorized by signed grant: %s v%d -> v%d\n", desired.PolicyID, highest, desired.Version)
+	return nil
+}
+
+// acceptedVersions returns the updated anti-downgrade high-water map that
+// accepting desired implies.
+//
+// An authorized rollback LOWERS the mark to the version it authorized, rather
+// than leaving a stale higher one in place. That is deliberate: the grant is
+// an explicit operator statement that this older version is now current, and
+// keeping the old high mark would force a signed grant for every ordinary
+// forward step afterwards. It does not weaken the guarantee -- an attacker
+// still cannot push anything below the lowest version an operator has
+// actually authorized, because getting there at all required a valid grant.
+func (s *sentinelSession) acceptedVersions(desired fleet.PolicyRef) map[string]int {
+	s.policyMu.RLock()
+	out := make(map[string]int, len(s.maxAccepted)+1)
+	for k, v := range s.maxAccepted {
+		out[k] = v
+	}
+	s.policyMu.RUnlock()
+	out[desired.PolicyID] = desired.Version
+	return out
+}
+
+// alreadyRejected reports whether this exact attempt -- same desired ref,
+// same rollback authorization -- has already been refused.
+func (s *sentinelSession) alreadyRejected(desired fleet.PolicyRef, grantSig string) bool {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	return s.lastRejectedRef.Equal(desired) && s.lastRejectedGrantSig == grantSig
+}
+
+func (s *sentinelSession) highestAccepted(policyID string) int {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	return s.maxAccepted[policyID]
+}
+
+// applyFleetPolicy is the single moment a verified policy becomes the policy
+// actually being enforced. Recorder.SetPolicy is an atomic pointer store, so
+// the very next filesystem evaluation uses the new config and none of them
+// ever observe a half-applied state.
+func (s *sentinelSession) applyFleetPolicy(desired fleet.PolicyRef, cfg *policy.Config, pv fleet.PolicyVersion, maxAccepted map[string]int) {
+	s.policyMu.Lock()
+	s.cfg = cfg
+	s.fleetPolicyRef = desired
+	s.maxAccepted = maxAccepted
+	s.lastRejectedRef = fleet.PolicyRef{}
+	s.lastRejectedGrantSig = ""
+	s.policyMu.Unlock()
+	s.rec.SetPolicy(cfg)
+}
+
 // reportReconcileStatus sends an out-of-band heartbeat carrying only a
-// reconcile self-report, best-effort. A failure here is logged and
-// swallowed like every other fleet call -- it never affects local
-// enforcement, and a missed status report is superseded by the next regular
-// heartbeat tick regardless.
+// reconcile self-report, best-effort. A failure here is logged and swallowed
+// like every other fleet call -- it never affects local enforcement, and a
+// missed status report is superseded by the next regular heartbeat regardless.
 func (s *sentinelSession) reportReconcileStatus(status, errMsg, forHash string) {
 	req := s.buildHeartbeatRequest()
 	req.ReconcileStatus = status
 	req.ReconcileError = errMsg
 	req.ReconcileForHash = forHash
 	if _, err := s.fleetClient.Heartbeat(req); err != nil {
-		fmt.Printf("WARN: fleet reconcile-status report failed: %v\n", err)
+		s.noteFleetError(err)
 	}
 }
 
-// failReconcile logs and reports a reconciliation failure for desired,
-// leaving the session's current cfg/fleetPolicyRef (its last-known-good
-// policy) completely untouched -- the whole point of validate-before-
-// install: an unusable remote policy must never replace a valid local one.
+// failReconcile records a TRANSIENT reconciliation failure (a fetch that did
+// not complete). The current policy is untouched, and the same desired ref
+// will be retried on the next heartbeat.
 func (s *sentinelSession) failReconcile(desired fleet.PolicyRef, reason string) {
 	fmt.Printf("WARN: fleet policy reconciliation failed for %s v%d: %s (keeping last-known-good policy)\n", desired.PolicyID, desired.Version, reason)
-	s.reportReconcileStatus("RECONCILE_FAILED", reason, desired.Hash)
+	s.reportReconcileStatus(fleet.ReconcileFailed, reason, desired.Hash)
+	s.bufferReport(fleet.ReportReconcileFailed, time.Now().UTC(), "", fmt.Sprintf("%s v%d: %s", desired.PolicyID, desired.Version, reason))
+	s.writeFleetStatus(reason)
 }
 
-// fleetLKGFile is the durable last-known-good record of the most recently
-// successfully-applied Fleet-managed policy for a repository: content and
-// identity together in one file, written via a single atomic rename
-// (installFleetPolicy) so there is never a window where the two could
-// disagree with each other (as two separate files could, if a crash landed
-// between writing them).
-type fleetLKGFile struct {
-	PolicyID  string    `json:"policy_id"`
-	Version   int       `json:"version"`
-	Hash      string    `json:"hash"`
-	YAML      string    `json:"yaml"`
-	AppliedAt time.Time `json:"applied_at"`
+// rejectReconcile records a DETERMINISTIC refusal -- bad content, bad
+// signature, or an unauthorized downgrade. Like failReconcile it leaves the
+// current last-known-good policy completely untouched (the whole point of
+// verify-before-install: an untrusted remote policy must never replace a
+// valid local one, and Sentinel never falls back to "no policy"), but it also
+// latches the rejected ref so the same doomed attempt is not repeated every
+// heartbeat.
+func (s *sentinelSession) rejectReconcile(status string, desired fleet.PolicyRef, grantSig, reason string) {
+	fmt.Printf("WARN: fleet policy %s v%d REJECTED (%s): %s (keeping last-known-good policy)\n", desired.PolicyID, desired.Version, status, reason)
+	s.policyMu.Lock()
+	s.lastRejectedRef = desired
+	s.lastRejectedGrantSig = grantSig
+	s.policyMu.Unlock()
+	s.reportReconcileStatus(status, reason, desired.Hash)
+	reportType := fleet.ReportSignatureInvalid
+	switch status {
+	case fleet.DowngradeRejected:
+		reportType = fleet.ReportDowngradeRejected
+	case fleet.ReconcileFailed:
+		reportType = fleet.ReportReconcileFailed
+	}
+	s.bufferReport(reportType, time.Now().UTC(), "", fmt.Sprintf("%s v%d: %s", desired.PolicyID, desired.Version, reason))
+	s.writeFleetStatus(reason)
 }
 
-func fleetPolicyLKGPath(repoAbs string) string {
-	return filepath.Join(repoAbs, ".airlock", "fleet-policy.json")
+// --- Buffered fleet reporting (Prompt 14B) ----------------------------------
+
+// collectReports turns governance events this session has logged since the
+// last pass into metadata-only fleet reports. It reads only the event type,
+// timestamp, and path -- never the diff, never file contents -- so what is
+// buffered for upload can never carry repository data off the machine.
+func (s *sentinelSession) collectReports() {
+	if s.outbox == nil {
+		return
+	}
+	evs := s.logger.EventsSnapshot()
+	for i := s.reportCursor; i < len(evs); i++ {
+		e := evs[i]
+		typ := reportTypeFor(e)
+		if typ == "" {
+			continue
+		}
+		s.bufferReport(typ, e.TS, e.Path, e.Summary)
+	}
+	s.reportCursor = len(evs)
 }
 
-// loadFleetLKG returns the last-known-good Fleet-managed policy for repoAbs,
-// if one has ever been successfully applied and both its stored content and
-// claimed hash are still internally consistent. ok=false (not an error,
-// nothing logged) simply means "nothing to restore yet" for a brand-new
-// Fleet-managed Sentinel -- it falls back to local airlock.yaml exactly
-// like a standalone Sentinel until its first successful reconciliation. A
-// corrupted or tampered LKG file (content hash no longer matches what was
-// recorded) is deliberately never trusted, for the same reason: never
-// enforce unknown or altered content just because a file exists on disk.
-func loadFleetLKG(repoAbs string) (*policy.Config, fleet.PolicyRef, bool) {
-	b, err := os.ReadFile(fleetPolicyLKGPath(repoAbs))
+// reportTypeFor classifies one governance event, mirroring how
+// governanceCounters and the Sentinel viewer already read the same events:
+// a denial that was reverted is REVERTED, one whose revert failed is
+// REVERT_FAILED (the case an operator most needs to see at fleet level), and
+// anything else denied is DENY.
+func reportTypeFor(e events.Event) string {
+	if e.Type != "POLICY_DENY" && e.Type != "APPROVAL_REQUIRED" {
+		return ""
+	}
+	if es, ok := e.Meta["revert_error"].(string); ok && es != "" {
+		return fleet.ReportRevertFailed
+	}
+	if rv, ok := e.Meta["reverted"].(bool); ok {
+		if rv {
+			return fleet.ReportReverted
+		}
+		return fleet.ReportRevertFailed
+	}
+	return fleet.ReportDeny
+}
+
+// bufferReport durably buffers one metadata-only report. The report id is
+// derived deterministically from its content, so re-buffering or re-uploading
+// the same event never produces a second fleet alert.
+func (s *sentinelSession) bufferReport(typ string, at time.Time, path, summary string) {
+	if s.outbox == nil || s.sentinelID == "" {
+		return
+	}
+	rel := path
+	if rel != "" {
+		if r, err := filepath.Rel(s.repoAbs, path); err == nil && !strings.HasPrefix(r, "..") {
+			rel = r
+		}
+	}
+	_ = s.outbox.Add(fleet.Report{
+		ID:         fleet.ReportID(s.sentinelID, s.sessionID, typ, at, rel+"|"+summary),
+		SentinelID: s.sentinelID,
+		SessionID:  s.sessionID,
+		Type:       typ,
+		At:         at.UTC(),
+		Path:       rel,
+		Summary:    summary,
+		RepoPath:   s.repoAbs,
+	})
+}
+
+// flushReports uploads buffered reports once the control plane is reachable
+// and this Sentinel is authenticated. Only ids the control plane explicitly
+// acknowledged are cleared, so a partial or failed flush leaves the remainder
+// buffered rather than silently losing it. Nothing about local enforcement
+// waits on any of this.
+func (s *sentinelSession) flushReports() {
+	if s.outbox == nil || s.outbox.Len() == 0 {
+		return
+	}
+	batch := s.outbox.Batch()
+	resp, err := s.fleetClient.SendReports(fleet.ReportBatch{SentinelID: s.sentinelID, Reports: batch})
 	if err != nil {
-		return nil, fleet.PolicyRef{}, false
+		s.noteFleetError(err)
+		return
 	}
-	var f fleetLKGFile
-	if err := json.Unmarshal(b, &f); err != nil {
-		return nil, fleet.PolicyRef{}, false
+	if err := s.outbox.Ack(resp.AcceptedIDs); err != nil {
+		fmt.Printf("WARN: could not clear delivered fleet reports: %v\n", err)
 	}
-	hash, cfg, err := fleet.ComputePolicyHash(f.YAML)
-	if err != nil || hash != f.Hash {
-		return nil, fleet.PolicyRef{}, false
-	}
-	return cfg, fleet.PolicyRef{PolicyID: f.PolicyID, Version: f.Version, Hash: f.Hash}, true
 }
 
-// installFleetPolicy durably and atomically records yamlContent as repoAbs's
-// new last-known-good Fleet policy: write to a temp file in the same
-// directory, then a single os.Rename over the real path. Same-directory
-// rename is atomic on the filesystems Airlock targets, so a reader (a
-// concurrent loadFleetLKG, or this same process after a crash mid-write)
-// only ever observes the complete old file or the complete new one, never a
-// partially-written one.
-func installFleetPolicy(repoAbs, yamlContent string, ref fleet.PolicyRef) error {
-	path := fleetPolicyLKGPath(repoAbs)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+// noteFleetError centralizes how a failed fleet call is interpreted. A
+// revoked credential is a state, not a transient error: it is recorded,
+// reported locally, and announced once rather than repeated every tick --
+// and, critically, it changes nothing about local enforcement.
+func (s *sentinelSession) noteFleetError(err error) {
+	if errors.Is(err, fleet.ErrCredentialRevoked) {
+		if s.getIdentityState() != "REVOKED" {
+			fmt.Printf("WARN: this Sentinel's Fleet credential has been REVOKED by the control plane.\n")
+			fmt.Printf("      Fleet participation has stopped. Local governance of %s continues unchanged,\n", s.repoAbs)
+			fmt.Printf("      still enforcing its last-known-good policy. Revocation removes a Sentinel from\n")
+			fmt.Printf("      the fleet; it is not a remote instruction to stop protecting this repository.\n")
+			s.setIdentityState("REVOKED")
+			s.bufferReport(fleet.ReportCredentialRevoked, time.Now().UTC(), "", "fleet credential revoked; local enforcement continues")
+			s.writeFleetStatus("fleet credential revoked")
+		}
+		return
 	}
-	f := fleetLKGFile{PolicyID: ref.PolicyID, Version: ref.Version, Hash: ref.Hash, YAML: yamlContent, AppliedAt: time.Now().UTC()}
-	b, err := json.MarshalIndent(f, "", "  ")
-	if err != nil {
-		return err
+	fmt.Printf("WARN: fleet call failed: %v (continuing local governance)\n", err)
+}
+
+// writeFleetStatus refreshes the locally-readable trust status file.
+func (s *sentinelSession) writeFleetStatus(lastErr string) {
+	if s.fleetClient == nil {
+		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
+	ref := s.getFleetPolicyRef()
+	st := fleetStatusFile{
+		FleetURL:       s.fleetClient.BaseURL(),
+		SentinelID:     s.sentinelID,
+		Connected:      s.isConnected(),
+		Identity:       s.getIdentityState(),
+		SignerKeyID:    s.getSignerKeyID(),
+		SignatureState: s.getSignatureState(),
+		PolicyID:       ref.PolicyID,
+		PolicyVersion:  ref.Version,
+		PolicyHash:     ref.Hash,
+		LastError:      lastErr,
 	}
-	return os.Rename(tmp, path)
+	if s.outbox != nil {
+		st.BufferedReports = s.outbox.Len()
+		st.DroppedReports = s.outbox.DroppedCount()
+	}
+	saveFleetStatus(s.repoAbs, st)
 }

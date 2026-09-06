@@ -56,7 +56,7 @@ func TestStore_UpsertEnroll_PreservesDesiredPolicyAssignment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.AssignPolicy("sen-1", PolicyRef{PolicyID: "production", Version: 3, Hash: "abc"}); err != nil {
+	if _, err := s.AssignPolicy("sen-1", PolicyRef{PolicyID: "production", Version: 3, Hash: "abc"}, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	rec, err := s.UpsertEnroll(Record{SentinelID: "sen-1", MachineID: "mach-1", LastHeartbeat: time.Now().UTC()})

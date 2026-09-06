@@ -18,19 +18,26 @@ import (
 )
 
 // fleetCmd wires the Airlock Fleet control-plane CLI: coordination,
-// inventory, and desired-state policy distribution -- never filesystem-
-// policy enforcement, which stays entirely local to each Sentinel (see
-// internal/cli/sentinel.go). No full auth/signing/revocation (Prompt 14B)
-// yet.
+// inventory, desired-state policy distribution, and the trust operations that
+// make those meaningful -- enrollment tokens, credential revocation, signed
+// policy, and the fleet alert feed. It never performs filesystem-policy
+// enforcement, which stays entirely local to each Sentinel (see
+// internal/cli/sentinel.go), and it has no command-execution surface of any
+// kind: the protocol carries desired policy and identity status, never
+// commands.
 func fleetCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "fleet",
 		Short: "Airlock Fleet control plane -- Sentinel enrollment, heartbeats, inventory, and policy distribution",
 	}
 	cmd.AddCommand(fleetServeCmd())
+	cmd.AddCommand(fleetInitCmd())
 	cmd.AddCommand(fleetListCmd())
 	cmd.AddCommand(fleetStatusCmd())
 	cmd.AddCommand(fleetPolicyCmd())
+	cmd.AddCommand(fleetEnrollTokenCmd())
+	cmd.AddCommand(fleetRevokeCmd())
+	cmd.AddCommand(fleetAlertsCmd())
 	return cmd
 }
 
@@ -41,8 +48,65 @@ func defaultFleetDBPath() string {
 	return filepath.Join(".airlock", "fleet.json")
 }
 
+// defaultFleetSigningKeyPath is where the control plane's Ed25519 policy
+// signing key lives. It sits beside the fleet stores, and is created 0600 by
+// LoadOrCreateSigningKey.
+func defaultFleetSigningKeyPath() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".airlock", "fleet-signing-key")
+	}
+	return filepath.Join(".airlock", "fleet-signing-key")
+}
+
+// fleetInitCmd bootstraps a control plane's signing identity without starting
+// it, so an operator can distribute the public key before any Sentinel
+// enrolls. It prints the key id and PUBLIC key only -- the private key is
+// written to disk at 0600 and never displayed, logged, or returned by any
+// API.
+func fleetInitCmd() *cobra.Command {
+	var keyPath string
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Create the control plane's policy signing key (idempotent)",
+		Long: `Creates the Ed25519 key this control plane signs Fleet policy with.
+
+The private key is written with owner-only permissions (0600) and is never
+printed, logged, or exposed through any API. The public key is written
+alongside it as <path>.pub and is safe to distribute -- Sentinels use it to
+verify that a policy really came from this control plane.
+
+Running this twice is safe: an existing key is loaded, not replaced.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(keyPath) == "" {
+				keyPath = defaultFleetSigningKeyPath()
+			}
+			key, created, err := fleet.LoadOrCreateSigningKey(keyPath)
+			if err != nil {
+				return err
+			}
+			if created {
+				fmt.Println("Created a new Fleet policy signing key.")
+			} else {
+				fmt.Println("Fleet policy signing key already exists (not replaced).")
+			}
+			fmt.Printf("Key file:   %s (private -- keep owner-only, never share)\n", keyPath)
+			fmt.Printf("Public key: %s.pub\n", keyPath)
+			fmt.Printf("Key ID:     %s\n", key.KeyID)
+			fmt.Printf("Public:     %s\n", key.PublicKeyHex())
+			fmt.Println()
+			fmt.Println("Distribute the PUBLIC key to Sentinels that should pin it explicitly:")
+			fmt.Printf("  airlock sentinel --repo . --fleet <url> --fleet-pubkey %s.pub\n", keyPath)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&keyPath, "key", "", "Signing key path (default ~/.airlock/fleet-signing-key)")
+	return cmd
+}
+
 func fleetServeCmd() *cobra.Command {
-	var listen, dbPath, policyDBPath, token string
+	var listen, dbPath, policyDBPath, authDBPath, alertDBPath, keyPath, token string
+	var tlsCert, tlsKey string
+	var requireEnrollment bool
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the Airlock Fleet control plane",
@@ -62,15 +126,43 @@ enrolled Sentinel keeps governing its repository locally and reconnects
 automatically once this process comes back -- no Sentinel restart required.
 
 Runs in the foreground (like 'airlock worker start'); Ctrl-C to stop, or
-manage it with your own process supervisor. --token is an optional shared
-secret for the v0 trust boundary -- see docs/architecture.md for what is and
-is not authenticated in this fleet foundation.`,
+manage it with your own process supervisor.
+
+TRUST POSTURE
+
+  --require-enrollment  Production posture. Every Sentinel must present a
+                        one-time enrollment token to enroll, and its own
+                        durable credential on every request thereafter.
+
+  (default)             Development posture. A Sentinel that has never been
+                        issued a credential may enroll and heartbeat without
+                        one. A Sentinel that HAS a credential must always
+                        present it -- that half is unconditional, so an
+                        enrolled identity can never be impersonated in either
+                        posture.
+
+  --tls-cert/--tls-key  Serve HTTPS. Bearer credentials over plaintext HTTP
+                        are only appropriate for loopback development; for
+                        anything else use these (or a TLS-terminating proxy).
+
+Policy is signed with the control plane's Ed25519 key (see 'airlock fleet
+init'). The private key is never printed and never exposed through any API.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(dbPath) == "" {
 				dbPath = defaultFleetDBPath()
 			}
+			dir := filepath.Dir(dbPath)
 			if strings.TrimSpace(policyDBPath) == "" {
-				policyDBPath = filepath.Join(filepath.Dir(dbPath), "fleet-policies.json")
+				policyDBPath = filepath.Join(dir, "fleet-policies.json")
+			}
+			if strings.TrimSpace(authDBPath) == "" {
+				authDBPath = filepath.Join(dir, "fleet-auth.json")
+			}
+			if strings.TrimSpace(alertDBPath) == "" {
+				alertDBPath = filepath.Join(dir, "fleet-alerts.json")
+			}
+			if strings.TrimSpace(keyPath) == "" {
+				keyPath = defaultFleetSigningKeyPath()
 			}
 			store, err := fleet.OpenStore(dbPath)
 			if err != nil {
@@ -80,29 +172,90 @@ is not authenticated in this fleet foundation.`,
 			if err != nil {
 				return fmt.Errorf("could not open fleet policy store %s: %w", policyDBPath, err)
 			}
+			authStore, err := fleet.OpenAuthStore(authDBPath)
+			if err != nil {
+				return fmt.Errorf("could not open fleet auth store %s: %w", authDBPath, err)
+			}
+			alertStore, err := fleet.OpenAlertStore(alertDBPath)
+			if err != nil {
+				return fmt.Errorf("could not open fleet alert store %s: %w", alertDBPath, err)
+			}
+			signingKey, createdKey, err := fleet.LoadOrCreateSigningKey(keyPath)
+			if err != nil {
+				return fmt.Errorf("could not load fleet signing key %s: %w", keyPath, err)
+			}
+			if (tlsCert == "") != (tlsKey == "") {
+				return fmt.Errorf("--tls-cert and --tls-key must be provided together")
+			}
+
 			ln, err := net.Listen("tcp", listen)
 			if err != nil {
 				return fmt.Errorf("unable to bind %s: %w", listen, err)
 			}
-			srv := fleet.NewServer(store, policyStore, token)
+			srv := fleet.NewServerWithOptions(store, policyStore, token, fleet.ServerOptions{
+				AuthStore:         authStore,
+				AlertStore:        alertStore,
+				SigningKey:        signingKey,
+				RequireEnrollment: requireEnrollment,
+			})
+
+			scheme := "http"
+			if tlsCert != "" {
+				scheme = "https"
+			}
 			fmt.Println("Airlock Fleet control plane started")
-			fmt.Printf("Listen: http://%s\n", ln.Addr().String())
-			fmt.Printf("Store:  %s\n", dbPath)
+			fmt.Printf("Listen:       %s://%s\n", scheme, ln.Addr().String())
+			fmt.Printf("Store:        %s\n", dbPath)
 			fmt.Printf("Policy store: %s\n", policyDBPath)
-			if strings.TrimSpace(token) == "" {
-				fmt.Println("Auth:   disabled (no --token set; see docs/architecture.md for the v0 trust boundary)")
+			fmt.Printf("Auth store:   %s\n", authDBPath)
+			fmt.Printf("Alert store:  %s\n", alertDBPath)
+			fmt.Printf("Signing key:  %s (key id %s)\n", keyPath, signingKey.KeyID)
+			if createdKey {
+				fmt.Println("              (generated just now; distribute the .pub file to pin it on Sentinels)")
+			}
+			if requireEnrollment {
+				fmt.Println("Enrollment:   REQUIRED -- create a token with 'airlock fleet enroll-token create'")
 			} else {
-				fmt.Println("Auth:   enabled (shared token required)")
+				fmt.Println("Enrollment:   optional (development posture). Enrolled Sentinels still require their own credential.")
+				fmt.Println("              Use --require-enrollment for a deployment where identity must be proven.")
+			}
+			if strings.TrimSpace(token) == "" {
+				fmt.Println("Operator API: UNAUTHENTICATED (no --token set)")
+			} else {
+				fmt.Println("Operator API: shared token required")
+			}
+			if tlsCert == "" && !isLoopbackListenAddr(ln.Addr().String()) {
+				fmt.Println("WARNING:      serving plaintext HTTP on a non-loopback address. Credentials will cross")
+				fmt.Println("              the network unencrypted. Use --tls-cert/--tls-key or a TLS proxy.")
 			}
 			fmt.Println("Ctrl-C to stop. Enrolled Sentinels keep governing locally regardless of this process's availability.")
+
+			if tlsCert != "" {
+				return http.ServeTLS(ln, srv.Handler(), tlsCert, tlsKey)
+			}
 			return http.Serve(ln, srv.Handler())
 		},
 	}
 	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:9090", "Listen address")
 	cmd.Flags().StringVar(&dbPath, "db", "", "Fleet inventory storage path (default ~/.airlock/fleet.json)")
 	cmd.Flags().StringVar(&policyDBPath, "policy-db", "", "Fleet policy storage path (default: fleet-policies.json next to --db)")
-	cmd.Flags().StringVar(&token, "token", "", "Optional shared enrollment/heartbeat token")
+	cmd.Flags().StringVar(&authDBPath, "auth-db", "", "Enrollment token/credential storage path (default: fleet-auth.json next to --db)")
+	cmd.Flags().StringVar(&alertDBPath, "alert-db", "", "Fleet alert storage path (default: fleet-alerts.json next to --db)")
+	cmd.Flags().StringVar(&keyPath, "signing-key", "", "Policy signing key path (default ~/.airlock/fleet-signing-key; created if absent)")
+	cmd.Flags().StringVar(&token, "token", "", "Optional shared operator token")
+	cmd.Flags().BoolVar(&requireEnrollment, "require-enrollment", false, "Require a one-time enrollment token and per-Sentinel credentials (production posture)")
+	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "TLS certificate file (serve HTTPS)")
+	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "TLS private key file (serve HTTPS)")
 	return cmd
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func fleetListCmd() *cobra.Command {
@@ -177,22 +330,24 @@ func fetchFleetSnapshot(fleetURL, token string) (*fleet.Snapshot, error) {
 func printFleetTable(fleetURL string, snap *fleet.Snapshot) {
 	fmt.Println("AIRLOCK FLEET")
 	fmt.Println()
-	fmt.Printf("%d Active\n%d Offline\n\n", snap.Active, snap.Offline)
+	fmt.Printf("%d Active\n%d Offline\n%d Drifted\n%d Revoked\n\n", snap.Active, snap.Offline, snap.Drifted, snap.Revoked)
 	if len(snap.Sentinels) == 0 {
 		fmt.Printf("No Sentinels enrolled with %s yet.\n", fleetURL)
 		fmt.Println("Enroll one with: airlock sentinel --repo . --fleet " + fleetURL + " --background")
 		return
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "SENTINEL\tSTATUS\tREPOSITORY\tDESIRED\tACTUAL\tSYNC\tHEARTBEAT")
+	fmt.Fprintln(w, "SENTINEL\tSTATUS\tIDENTITY\tREPOSITORY\tDESIRED\tACTUAL\tSYNC\tSIGNATURE\tHEARTBEAT")
 	for _, sv := range snap.Sentinels {
 		id := sv.SentinelID
 		if len(id) > 8 {
 			id = id[:8]
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			id, sv.Health, sv.RepoPath, policyRefLabel(sv.DesiredPolicyID, itoaOrDash(sv.DesiredPolicyVersion)),
-			policyRefLabel(sv.PolicyID, sv.PolicyVersion), syncLabel(sv.PolicyState), fleet.FormatAge(sv.LastHeartbeat))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			id, sv.Health, sv.Identity, sv.RepoPath,
+			policyRefLabel(sv.DesiredPolicyID, itoaOrDash(sv.DesiredPolicyVersion)),
+			policyRefLabel(sv.PolicyID, sv.PolicyVersion), syncLabel(sv.PolicyState),
+			dashIfEmpty(sv.SignatureState), fleet.FormatAge(sv.LastHeartbeat))
 	}
 	_ = w.Flush()
 }
@@ -212,6 +367,13 @@ func itoaOrDash(v int) string {
 		return "-"
 	}
 	return strconv.Itoa(v)
+}
+
+func dashIfEmpty(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "-"
+	}
+	return s
 }
 
 func syncLabel(policyState string) string {
@@ -459,4 +621,226 @@ func fleetPost(fleetURL, token, path string, body, out any) error {
 		return fmt.Errorf("fleet control plane returned %s: %s", resp.Status, strings.TrimSpace(string(msg)))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// --- Trust CLI (Prompt 14B) -------------------------------------------------
+
+func fleetEnrollTokenCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "enroll-token",
+		Short: "Create, list, and revoke one-time Sentinel enrollment tokens",
+	}
+	cmd.AddCommand(fleetEnrollTokenCreateCmd())
+	cmd.AddCommand(fleetEnrollTokenListCmd())
+	cmd.AddCommand(fleetEnrollTokenRevokeCmd())
+	return cmd
+}
+
+type enrollTokenCreated struct {
+	ID    string    `json:"id"`
+	Token string    `json:"token"`
+	Note  string    `json:"note"`
+	Ends  time.Time `json:"expires_at"`
+}
+
+func fleetEnrollTokenCreateCmd() *cobra.Command {
+	var fleetURL, token, description string
+	var ttlMinutes int
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Mint a one-time enrollment token for a new Sentinel",
+		Long: `Creates a single-use, expiring token that authorizes exactly one Sentinel
+to enroll and receive its own durable credential.
+
+The token is shown ONCE. The control plane stores only its hash and cannot
+display it again -- if it is lost, revoke it and create another. Deliver it
+to the target machine out-of-band, the same way you would any other secret.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			body := map[string]any{"description": description, "ttl_seconds": ttlMinutes * 60}
+			var created enrollTokenCreated
+			if err := fleetPost(fleetURL, token, "/api/fleet/enroll-tokens", body, &created); err != nil {
+				return err
+			}
+			fmt.Println("Enrollment token created. It is shown once and cannot be retrieved again.")
+			fmt.Printf("  Token:   %s\n", created.Token)
+			fmt.Printf("  ID:      %s\n", created.ID)
+			fmt.Printf("  Expires: %s\n", created.Ends.Format(time.RFC3339))
+			fmt.Println()
+			fmt.Println("Enroll a Sentinel with it:")
+			fmt.Printf("  airlock sentinel --repo . --fleet %s --fleet-enroll-token %s --background\n", fleetURL, created.Token)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet operator token")
+	cmd.Flags().StringVar(&description, "description", "", "Optional note about who this token is for")
+	cmd.Flags().IntVar(&ttlMinutes, "ttl-minutes", 60, "How long the token stays usable")
+	return cmd
+}
+
+// enrollTokenRow mirrors fleet.EnrollTokenRecord for display. Note what is
+// absent: no token material of any kind, only its hash-derived id.
+type enrollTokenRow struct {
+	ID          string     `json:"id"`
+	Description string     `json:"description,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   time.Time  `json:"expires_at"`
+	UsedAt      *time.Time `json:"used_at,omitempty"`
+	UsedBy      string     `json:"used_by,omitempty"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
+}
+
+func (r enrollTokenRow) state(now time.Time) string {
+	switch {
+	case r.RevokedAt != nil:
+		return "REVOKED"
+	case r.UsedAt != nil:
+		return "USED"
+	case now.After(r.ExpiresAt):
+		return "EXPIRED"
+	default:
+		return "VALID"
+	}
+}
+
+func fleetEnrollTokenListCmd() *cobra.Command {
+	var fleetURL, token string
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List enrollment tokens and their state (never their values)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var rows []enrollTokenRow
+			if err := fleetGet(fleetURL, token, "/api/fleet/enroll-tokens", &rows); err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				fmt.Println("No enrollment tokens have been created.")
+				fmt.Println("Create one with: airlock fleet enroll-token create")
+				return nil
+			}
+			now := time.Now().UTC()
+			w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+			fmt.Fprintln(w, "ID\tSTATE\tEXPIRES\tUSED BY\tDESCRIPTION")
+			for _, r := range rows {
+				usedBy := r.UsedBy
+				if usedBy == "" {
+					usedBy = "-"
+				} else if len(usedBy) > 8 {
+					usedBy = usedBy[:8]
+				}
+				desc := r.Description
+				if desc == "" {
+					desc = "-"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.state(now), r.ExpiresAt.Format(time.RFC3339), usedBy, desc)
+			}
+			_ = w.Flush()
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet operator token")
+	return cmd
+}
+
+func fleetEnrollTokenRevokeCmd() *cobra.Command {
+	var fleetURL, token string
+	cmd := &cobra.Command{
+		Use:   "revoke <token-id>",
+		Short: "Make an unused enrollment token permanently unusable",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var out map[string]any
+			if err := fleetPost(fleetURL, token, "/api/fleet/enroll-tokens/"+args[0]+"/revoke", map[string]any{}, &out); err != nil {
+				return err
+			}
+			fmt.Printf("Enrollment token %s revoked.\n", args[0])
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet operator token")
+	return cmd
+}
+
+func fleetRevokeCmd() *cobra.Command {
+	var fleetURL, token, reason string
+	cmd := &cobra.Command{
+		Use:   "revoke <sentinel-id>",
+		Short: "Revoke a Sentinel's Fleet credential",
+		Long: `Revokes a Sentinel's credential so it can no longer participate in Fleet.
+
+What this does:   the credential stops authenticating. The Sentinel can no
+                  longer heartbeat, fetch policy, or upload reports.
+
+What it does NOT do: stop that Sentinel from governing its repository. It
+                  keeps enforcing its last-known-good policy locally and
+                  reports its revoked Fleet identity in its own status.
+
+That boundary is deliberate. If revocation could switch off local protection,
+central revocation would become a remote off-switch for the thing Airlock
+exists to do.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var view fleet.SentinelView
+			if err := fleetPost(fleetURL, token, "/api/fleet/sentinels/"+args[0]+"/revoke", map[string]any{"reason": reason}, &view); err != nil {
+				return err
+			}
+			fmt.Printf("Sentinel %s credential REVOKED.\n", args[0])
+			fmt.Println("It can no longer participate in Fleet.")
+			fmt.Println("It continues enforcing its last-known-good policy locally -- revocation is not a remote stop.")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet operator token")
+	cmd.Flags().StringVar(&reason, "reason", "", "Why this credential is being revoked (recorded for operators)")
+	return cmd
+}
+
+func fleetAlertsCmd() *cobra.Command {
+	var fleetURL, token string
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "alerts",
+		Short: "Show recent fleet-wide governance alerts reported by Sentinels",
+		Long: `Shows recent metadata-only alerts (denials, reverts, revert failures, policy
+applications, trust rejections) uploaded by enrolled Sentinels.
+
+This is a fleet-level activity view, not an evidence store. Raw evidence --
+diffs, contents, full event logs -- never leaves the machine that produced it
+and remains authoritative there ('airlock inspect/replay/verify').`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var alerts []fleet.Report
+			if err := fleetGet(fleetURL, token, fmt.Sprintf("/api/fleet/alerts?limit=%d", limit), &alerts); err != nil {
+				return err
+			}
+			if len(alerts) == 0 {
+				fmt.Println("No fleet alerts reported yet.")
+				return nil
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+			fmt.Fprintln(w, "WHEN\tSENTINEL\tREPOSITORY\tTYPE\tPATH")
+			for _, a := range alerts {
+				id := a.SentinelID
+				if len(id) > 8 {
+					id = id[:8]
+				}
+				path := a.Path
+				if path == "" {
+					path = a.Summary
+				}
+				if path == "" {
+					path = "-"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", fleet.FormatAge(a.At), id, filepath.Base(a.RepoPath), a.Type, path)
+			}
+			_ = w.Flush()
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet operator token")
+	cmd.Flags().IntVar(&limit, "limit", 30, "How many recent alerts to show")
+	return cmd
 }

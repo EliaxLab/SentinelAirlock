@@ -65,12 +65,41 @@ type EnrollRequest struct {
 	PolicyID        string    `json:"policy_id,omitempty"`
 	PolicyVersion   string    `json:"policy_version,omitempty"`
 	PolicyHash      string    `json:"policy_hash,omitempty"`
+
+	// EnrollToken is a one-time operator-issued enrollment token (Prompt
+	// 14B). It is presented only on a Sentinel's *first* enrollment; every
+	// later enrollment and heartbeat authenticates with the durable
+	// credential the control plane issues in exchange. See internal/fleet/
+	// auth.go for the full trust flow.
+	EnrollToken string `json:"enroll_token,omitempty"`
 }
 
-// EnrollResponse acknowledges enrollment.
+// EnrollResponse acknowledges enrollment and, on a first enrollment, hands
+// back the two pieces of trust material a Sentinel needs for the rest of its
+// life: its own durable credential, and the control plane's policy-signing
+// public key.
+//
+// Credential is returned exactly once, at the moment it is created. The
+// control plane stores only its hash and can never show it again -- if it is
+// lost, the credential must be revoked and the Sentinel re-enrolled.
 type EnrollResponse struct {
 	SentinelID string `json:"sentinel_id"`
 	Enrolled   bool   `json:"enrolled"`
+	Credential string `json:"credential,omitempty"`
+
+	// SigningKeyID/SigningPublicKey advertise the key this control plane
+	// signs policy with. A Sentinel pins them at enrollment -- the moment
+	// authorized by an out-of-band enrollment token -- and thereafter refuses
+	// policy signed by anything else. See internal/cli/sentinel.go's
+	// fleetTrustFile.
+	SigningKeyID     string `json:"signing_key_id,omitempty"`
+	SigningPublicKey string `json:"signing_public_key,omitempty"`
+
+	// RequireEnrollment tells a Sentinel whether this control plane is
+	// running the authenticated production posture or the documented
+	// development posture, so the Sentinel can say so in its own local status
+	// rather than leaving an operator to guess.
+	RequireEnrollment bool `json:"require_enrollment"`
 }
 
 // HeartbeatRequest is small, frequent, and carries no file contents, diffs,
@@ -103,6 +132,16 @@ type HeartbeatRequest struct {
 	ReconcileStatus  string `json:"reconcile_status,omitempty"`
 	ReconcileError   string `json:"reconcile_error,omitempty"`
 	ReconcileForHash string `json:"reconcile_for_hash,omitempty"`
+
+	// Trust self-report (Prompt 14B): how the Sentinel verified the policy it
+	// is currently enforcing ("VERIFIED", "UNSIGNED", or "" if it is not
+	// running a Fleet-managed policy), which key it verified against, and how
+	// many reports it currently has buffered undelivered. These are
+	// descriptive, not authoritative -- the control plane displays them, and
+	// never uses a Sentinel's own claim as evidence about that Sentinel.
+	SignatureState  string `json:"signature_state,omitempty"`
+	SignerKeyID     string `json:"signer_key_id,omitempty"`
+	BufferedReports int    `json:"buffered_reports,omitempty"`
 }
 
 // HeartbeatResponse acknowledges a heartbeat and carries the Sentinel's
@@ -116,6 +155,20 @@ type HeartbeatResponse struct {
 	DesiredPolicyID      string `json:"desired_policy_id,omitempty"`
 	DesiredPolicyVersion int    `json:"desired_policy_version,omitempty"`
 	DesiredPolicyHash    string `json:"desired_policy_hash,omitempty"`
+
+	// DesiredPolicyDigest is the full canonical SHA-256 of the desired
+	// version (Prompt 14B). The short hash above remains the drift
+	// fingerprint; this is what a rollback grant binds to.
+	DesiredPolicyDigest string `json:"desired_policy_digest,omitempty"`
+
+	// RollbackGrant, when present, is a signed authorization for this
+	// specific Sentinel to move backwards to the desired version. It is
+	// carried in the response body rather than being implied by a flag
+	// precisely because the response channel is not itself trusted: the
+	// grant's signature is what authorizes the downgrade, so an attacker who
+	// can rewrite this response still cannot manufacture one. See
+	// VerifyRollbackGrant.
+	RollbackGrant *RollbackGrant `json:"rollback_grant,omitempty"`
 }
 
 // Record is the control plane's durable view of one Sentinel installation.
@@ -176,6 +229,29 @@ type Record struct {
 	ReconcileForHash string     `json:"reconcile_for_hash,omitempty"`
 	LastReconcileAt  *time.Time `json:"last_reconcile_at,omitempty"`
 
+	// Trust state (Prompt 14B). CredentialIssued/Revoked are set by the
+	// control plane from its own auth store -- never from anything a Sentinel
+	// says about itself -- and are what IdentityState computes from.
+	// SignatureState/SignerKeyID are the Sentinel's descriptive self-report
+	// of how it verified the policy it is enforcing.
+	CredentialIssued bool       `json:"credential_issued,omitempty"`
+	Revoked          bool       `json:"revoked,omitempty"`
+	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
+	RevokedReason    string     `json:"revoked_reason,omitempty"`
+	SignatureState   string     `json:"signature_state,omitempty"`
+	SignerKeyID      string     `json:"signer_key_id,omitempty"`
+	BufferedReports  int        `json:"buffered_reports,omitempty"`
+
+	// DesiredPolicyDigest is the full canonical digest of the desired
+	// version, carried alongside the short DesiredPolicyHash so a rollback
+	// grant can be bound to content rather than to a truncated fingerprint.
+	DesiredPolicyDigest string `json:"desired_policy_digest,omitempty"`
+
+	// RollbackGrant is a signed, expiring authorization for this Sentinel to
+	// accept the currently-desired version even though it is older than one
+	// it has already run. Set only by an explicit operator rollback.
+	RollbackGrant *RollbackGrant `json:"rollback_grant,omitempty"`
+
 	EnrolledAt        time.Time  `json:"enrolled_at"`
 	StartedAt         time.Time  `json:"started_at"`
 	LastHeartbeat     time.Time  `json:"last_heartbeat"`
@@ -209,19 +285,39 @@ type SentinelView struct {
 	Health           string `json:"health"`
 	PolicyState      string `json:"policy_state,omitempty"`
 	PolicyStateError string `json:"policy_state_error,omitempty"`
+
+	// Identity is the computed AUTHENTICATED/UNAUTHENTICATED/REVOKED trust
+	// state (Prompt 14B) -- see IdentityState.
+	Identity string `json:"identity"`
 }
 
 func newSentinelView(rec Record, now time.Time) SentinelView {
 	status, errMsg := ReconcileState(rec)
-	return SentinelView{Record: rec, Health: Health(rec, now), PolicyState: status, PolicyStateError: errMsg}
+	return SentinelView{
+		Record:           rec,
+		Health:           Health(rec, now),
+		PolicyState:      status,
+		PolicyStateError: errMsg,
+		Identity:         IdentityState(rec),
+	}
 }
 
 // Snapshot is the fleet inventory at a point in time: summary counts plus
 // every known Sentinel (offline ones are retained with last-seen
 // information, never silently dropped).
 type Snapshot struct {
-	Now       time.Time      `json:"now"`
-	Active    int            `json:"active"`
-	Offline   int            `json:"offline"`
+	Now     time.Time `json:"now"`
+	Active  int       `json:"active"`
+	Offline int       `json:"offline"`
+
+	// Drifted and Revoked (Prompt 14B) are computed the same way Active/
+	// Offline are -- counted fresh from the same computed per-Sentinel states
+	// shown in the table, never stored. Drifted counts anything not IN_SYNC
+	// among Fleet-policy-managed Sentinels, including reconciliation
+	// failures, since from an operator's point of view all of those mean "not
+	// running what I asked for."
+	Drifted int `json:"drifted"`
+	Revoked int `json:"revoked"`
+
 	Sentinels []SentinelView `json:"sentinels"`
 }

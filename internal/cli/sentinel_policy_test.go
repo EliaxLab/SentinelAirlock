@@ -99,7 +99,7 @@ func TestSentinel_PolicyReconciliation_DriftToInSync_RealFilesystemEffect(t *tes
 	}
 	assignPolicyViaHTTP(t, srv.URL, sentinelID, "production", v1.Version)
 
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestSentinel_PolicyReconciliation_SuccessReportedPromptly(t *testing.T) {
 	}
 	assignPolicyViaHTTP(t, srv.URL, sentinelID, "production", v1.Version)
 
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestSentinel_PolicyReconciliation_HashMismatch_KeepsLastKnownGood(t *testin
 	}
 	assignPolicyViaHTTP(t, srv.URL, sentinelID, "production", v1.Version)
 
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestSentinel_PolicyReconciliation_HashMismatch_KeepsLastKnownGood(t *testin
 	// integrity check, not a YAML parse failure (PolicyStore's own Create/
 	// AddVersion already reject invalid YAML, so a stored version can never
 	// itself be unparsable).
-	if _, err := store.AssignPolicy(sentinelID, fleet.PolicyRef{PolicyID: "production", Version: v1.Version, Hash: "not-the-real-hash"}); err != nil {
+	if _, err := store.AssignPolicy(sentinelID, fleet.PolicyRef{PolicyID: "production", Version: v1.Version, Hash: "not-the-real-hash"}, "", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -276,7 +276,7 @@ func TestSentinel_PolicyReconciliation_IdenticalDesiredState_NoRedundantReinstal
 	}
 	assignPolicyViaHTTP(t, srv.URL, sentinelID, "production", v1.Version)
 
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestSentinel_PolicyReconciliation_LKGPersistsAcrossRestartEvenIfFleetUnreac
 	}
 	assignPolicyViaHTTP(t, srv.URL, sentinelID, "production", v1.Version)
 
-	sess1, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess1, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestSentinel_PolicyReconciliation_LKGPersistsAcrossRestartEvenIfFleetUnreac
 	// from this Sentinel's perspective at startup. It must restore and keep
 	// enforcing v1 from the durable LKG, never silently fall back to local
 	// airlock.yaml (which has no deny rule for special.txt at all).
-	sess2, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, unreachableFleetURL(t), "")
+	sess2, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: unreachableFleetURL(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,14 +376,14 @@ func TestSentinel_PolicyReconciliation_ResumesAfterControlPlaneRestart(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AssignPolicy(sentinelID, fleet.PolicyRef{PolicyID: "production", Version: v1.Version, Hash: v1.Hash}); err != nil {
+	if _, err := store.AssignPolicy(sentinelID, fleet.PolicyRef{PolicyID: "production", Version: v1.Version, Hash: v1.Hash}, "", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	addr := reserveTestAddr(t)
 	srv1 := startFleetServerOn(t, addr, store, policyStore)
 
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, "http://"+addr, "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: "http://" + addr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,7 @@ func TestSentinel_PolicyReconciliation_ResumesAfterControlPlaneRestart(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AssignPolicy(sentinelID, fleet.PolicyRef{PolicyID: "production", Version: v2.Version, Hash: v2.Hash}); err != nil {
+	if _, err := store.AssignPolicy(sentinelID, fleet.PolicyRef{PolicyID: "production", Version: v2.Version, Hash: v2.Hash}, "", nil); err != nil {
 		t.Fatal(err)
 	}
 

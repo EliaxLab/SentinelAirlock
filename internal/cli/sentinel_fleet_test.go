@@ -66,7 +66,7 @@ func TestSentinel_FleetIdentity_DurableAcrossRestart_SessionIndependent(t *testi
 	repoAbs := canonicalRepo(t, dir)
 	srv := newTestFleetServer(t)
 
-	sess1, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess1, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestSentinel_FleetIdentity_DurableAcrossRestart_SessionIndependent(t *testi
 	}
 	sess1.shutdown()
 
-	sess2, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess2, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestSentinel_FleetHeartbeat_ReportsVersionRepoPolicyCounters(t *testing.T) 
 	repoAbs := canonicalRepo(t, dir)
 	srv := newTestFleetServer(t)
 
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestSentinel_FleetUnreachable_LocalGovernanceContinues(t *testing.T) {
 	repoAbs := canonicalRepo(t, dir)
 	unreachable := unreachableFleetURL(t)
 
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, unreachable, "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: unreachable})
 	if err != nil {
 		t.Fatalf("session must start even when the fleet control plane is unreachable: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestSentinel_FleetEnroll_RepoPathWithSpaces(t *testing.T) {
 	repoAbs := canonicalRepo(t, dir)
 	srv := newTestFleetServer(t)
 
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, srv.URL, "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}

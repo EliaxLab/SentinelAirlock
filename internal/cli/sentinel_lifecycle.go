@@ -117,7 +117,7 @@ func runningSentinelDetailed(repoAbs string) (sentinelMeta, bool, error) {
 
 // startSentinelBackground launches a detached child running the foreground
 // Sentinel loop against repoAbs, then returns control to the terminal.
-func startSentinelBackground(repoAbs, policyPath, policyPack, fleetURL, fleetToken string) error {
+func startSentinelBackground(repoAbs, policyPath, policyPack string, fo fleetOptions) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("cannot locate airlock binary: %w", err)
@@ -138,11 +138,20 @@ func startSentinelBackground(repoAbs, policyPath, policyPack, fleetURL, fleetTok
 	if policyPack != "" {
 		args = append(args, "--policy-pack", policyPack)
 	}
-	if fleetURL != "" {
-		args = append(args, "--fleet", fleetURL)
+	if fo.URL != "" {
+		args = append(args, "--fleet", fo.URL)
 	}
-	if fleetToken != "" {
-		args = append(args, "--fleet-token", fleetToken)
+	if fo.Token != "" {
+		args = append(args, "--fleet-token", fo.Token)
+	}
+	if fo.EnrollToken != "" {
+		args = append(args, "--fleet-enroll-token", fo.EnrollToken)
+	}
+	if fo.PublicKey != "" {
+		args = append(args, "--fleet-pubkey", fo.PublicKey)
+	}
+	if fo.CACert != "" {
+		args = append(args, "--fleet-ca", fo.CACert)
 	}
 
 	cmd := exec.Command(self, args...)
@@ -202,8 +211,54 @@ func sentinelStatusCmd(repoAbs string) error {
 	}
 	fmt.Printf("Session:    %s\n", m.Session)
 	fmt.Printf("Log:        %s\n", m.Log)
+	printFleetTrustStatus(repoAbs)
 	fmt.Printf("Stop with:  airlock sentinel --repo %s --stop\n", repoAbs)
 	return nil
+}
+
+// printFleetTrustStatus shows the Fleet trust state of a Fleet-managed
+// Sentinel (Prompt 14B), or nothing at all for a standalone one.
+//
+// This is the local half of the trust UI, and it is the half that still works
+// when the control plane is gone: what identity this Sentinel holds, which
+// key it verified its policy against, what it is enforcing, and how much it
+// has buffered while disconnected -- all readable without reaching anything
+// over the network.
+func printFleetTrustStatus(repoAbs string) {
+	st, ok := loadFleetStatus(repoAbs)
+	if !ok {
+		return
+	}
+	fmt.Println()
+	fmt.Println("Fleet")
+	reach := "reachable"
+	if !st.Connected {
+		reach = "UNREACHABLE -- local governance continues regardless"
+	}
+	fmt.Printf("  Control plane:   %s (%s)\n", st.FleetURL, reach)
+	fmt.Printf("  Identity:        %s\n", st.Identity)
+	if st.SignatureState != "" {
+		fmt.Printf("  Policy signature: %s\n", st.SignatureState)
+	}
+	if st.SignerKeyID != "" {
+		fmt.Printf("  Policy signer:   %s\n", st.SignerKeyID)
+	}
+	if st.PolicyID != "" {
+		fmt.Printf("  Policy:          %s v%d (hash %s)\n", st.PolicyID, st.PolicyVersion, st.PolicyHash)
+	}
+	if st.BufferedReports > 0 {
+		fmt.Printf("  Buffered reports: %d (will upload when the control plane is reachable)\n", st.BufferedReports)
+	}
+	if st.DroppedReports > 0 {
+		fmt.Printf("  Dropped reports:  %d (buffer limit reached during a long outage)\n", st.DroppedReports)
+	}
+	if st.LastError != "" {
+		fmt.Printf("  Last issue:      %s\n", st.LastError)
+	}
+	if st.Identity == "REVOKED" {
+		fmt.Println("  NOTE: this Sentinel's Fleet credential was revoked. It is no longer part of the fleet,")
+		fmt.Println("        and it is still governing this repository with its last-known-good policy.")
+	}
 }
 
 // sentinelStopCmd terminates the running Sentinel for repoAbs and clears its

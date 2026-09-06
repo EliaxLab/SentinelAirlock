@@ -70,26 +70,31 @@ func TestRecorder_Seed_DeniedModifyRestoresOriginalContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Wait on the EVENT, not on the file's contents. The recorder reverts the
+	// file before it logs the denial (see evaluate in recorder.go), so polling
+	// the file can succeed inside that gap and then find no event yet -- a
+	// race that is invisible on a fast machine and reproducible on a loaded
+	// one. Observing the event implies the revert already happened, so this
+	// order is both correct and strictly stronger.
+	var denial events.Event
 	ok := pollUntil(t, 2*time.Second, func() bool {
-		b, _ := os.ReadFile(envPath)
-		return string(b) == "ORIGINAL=1\n"
+		for _, e := range log.EventsSnapshot() {
+			if e.Type == "POLICY_DENY" && e.Path == ".env" {
+				denial = e
+				return true
+			}
+		}
+		return false
 	})
 	if !ok {
 		b, _ := os.ReadFile(envPath)
+		t.Fatalf("expected a POLICY_DENY event for .env (file content is now %q)", b)
+	}
+	if reverted, _ := denial.Meta["reverted"].(bool); !reverted {
+		t.Errorf("expected Meta[reverted]=true, got %v", denial.Meta["reverted"])
+	}
+	if b, _ := os.ReadFile(envPath); string(b) != "ORIGINAL=1\n" {
 		t.Fatalf("expected .env restored to ORIGINAL=1, got %q", b)
-	}
-
-	found := false
-	for _, e := range log.EventsSnapshot() {
-		if e.Type == "POLICY_DENY" && e.Path == ".env" {
-			found = true
-			if reverted, _ := e.Meta["reverted"].(bool); !reverted {
-				t.Errorf("expected Meta[reverted]=true, got %v", e.Meta["reverted"])
-			}
-		}
-	}
-	if !found {
-		t.Error("expected a POLICY_DENY event for .env")
 	}
 }
 
@@ -264,7 +269,15 @@ func TestRecorder_Debounced_CoalescesRapidWrites(t *testing.T) {
 	}
 
 	log := newTestLogger(t, evDir)
-	rec, err := NewDebounced(root, log, denyingPolicy(), governance.ApprovalAuto, 150*time.Millisecond)
+	// A 2s debounce window against ~15ms writes. The window has to be wide
+	// relative to SCHEDULING JITTER, not just to the sleeps: if the goroutine
+	// running this loop is descheduled for longer than the window between two
+	// writes -- routine on a loaded CI runner, never seen on an idle laptop --
+	// the window closes mid-burst and the burst is legitimately recorded as
+	// several events. That measures the machine, not the coalescing. The
+	// assertion below is unchanged and just as strict; only the headroom grew,
+	// and Stop() drains the pending evaluation so the test stays fast.
+	rec, err := NewDebounced(root, log, denyingPolicy(), governance.ApprovalAuto, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +292,7 @@ func TestRecorder_Debounced_CoalescesRapidWrites(t *testing.T) {
 		if err := os.WriteFile(path, []byte("v"+string(rune('1'+i))), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(15 * time.Millisecond) // well inside the 150ms debounce window
+		time.Sleep(15 * time.Millisecond) // well inside the debounce window
 	}
 
 	if err := rec.Stop(); err != nil {

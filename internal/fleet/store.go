@@ -71,6 +71,8 @@ func (s *Store) UpsertEnroll(rec Record) (Record, error) {
 		rec.DesiredPolicyID = existing.DesiredPolicyID
 		rec.DesiredPolicyVersion = existing.DesiredPolicyVersion
 		rec.DesiredPolicyHash = existing.DesiredPolicyHash
+		rec.DesiredPolicyDigest = existing.DesiredPolicyDigest
+		rec.RollbackGrant = existing.RollbackGrant
 		rec.ReconcileStatus = existing.ReconcileStatus
 		rec.ReconcileError = existing.ReconcileError
 		rec.ReconcileForHash = existing.ReconcileForHash
@@ -111,7 +113,11 @@ func (s *Store) UpsertHeartbeat(id string, apply func(*Record)) (Record, error) 
 // in the rest of. Assigning does not touch ReconcileStatus/Error: a fresh
 // assignment naturally reads as DRIFTED (via ReconcileState) until the
 // Sentinel next reconciles, which is the correct, honest transition.
-func (s *Store) AssignPolicy(sentinelID string, ref PolicyRef) (Record, error) {
+// digest is the full canonical digest of the assigned version and grant is an
+// optional signed downgrade authorization (Prompt 14B); grant is cleared on
+// every assignment that does not supply one, so a rollback authorization can
+// never linger and silently authorize a later, unrelated downgrade.
+func (s *Store) AssignPolicy(sentinelID string, ref PolicyRef, digest string, grant *RollbackGrant) (Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec := s.records[sentinelID]
@@ -121,6 +127,8 @@ func (s *Store) AssignPolicy(sentinelID string, ref PolicyRef) (Record, error) {
 	rec.DesiredPolicyID = ref.PolicyID
 	rec.DesiredPolicyVersion = ref.Version
 	rec.DesiredPolicyHash = ref.Hash
+	rec.DesiredPolicyDigest = digest
+	rec.RollbackGrant = grant
 	s.records[sentinelID] = rec
 	if err := s.saveLocked(); err != nil {
 		return Record{}, err

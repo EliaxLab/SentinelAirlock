@@ -2,9 +2,13 @@ package fleet
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -17,14 +21,16 @@ import (
 // the mechanical enforcement of the fleet-foundation's non-negotiable
 // disconnected-operation requirement.
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	baseURL    string
+	token      string
+	credential string
+	http       *http.Client
 }
 
 // NewClient builds a Client for baseURL (the control plane's address).
 // token is optional; when set it is sent as both a Bearer Authorization
-// header and X-Airlock-Fleet-Token, matching Server.authorized.
+// header and X-Airlock-Fleet-Token, matching the control plane's operator
+// token check.
 func NewClient(baseURL, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
@@ -33,11 +39,64 @@ func NewClient(baseURL, token string) *Client {
 	}
 }
 
+// SetCredential attaches this Sentinel's durable per-Sentinel credential
+// (Prompt 14B). Once set, every request carries it and the control plane
+// resolves this Sentinel's identity from it rather than from any field in the
+// request body.
+func (c *Client) SetCredential(credential string) {
+	c.credential = strings.TrimSpace(credential)
+}
+
+// HasCredential reports whether this client is authenticating as a specific
+// enrolled Sentinel.
+func (c *Client) HasCredential() bool { return c.credential != "" }
+
+// UsesTLS reports whether the control-plane URL is https. Used to warn
+// operators who are about to send credentials over plaintext HTTP to a
+// non-loopback host -- see internal/cli/sentinel.go's transport check.
+func (c *Client) UsesTLS() bool { return strings.HasPrefix(c.baseURL, "https://") }
+
+// BaseURL returns the configured control-plane address.
+func (c *Client) BaseURL() string { return c.baseURL }
+
+// SetRootCA makes this client trust the PEM certificate bundle at path in
+// addition to nothing else -- for a self-hosted control plane fronted by a
+// private CA or a self-signed certificate. Certificate verification stays
+// fully enabled; this adds a trust anchor rather than disabling checking,
+// and there is deliberately no option in this client to skip verification.
+func (c *Client) SetRootCA(path string) error {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("could not read fleet CA bundle %s: %w", path, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return fmt.Errorf("fleet CA bundle %s contains no usable certificates", path)
+	}
+	c.http = &http.Client{
+		Timeout:   ClientTimeout,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
+	}
+	return nil
+}
+
 // Enroll registers or refreshes this Sentinel's identity with the control
-// plane.
-func (c *Client) Enroll(req EnrollRequest) error {
+// plane and returns the response, which on a first enrollment carries the
+// Sentinel's durable credential and the control plane's policy-signing public
+// key.
+func (c *Client) Enroll(req EnrollRequest) (EnrollResponse, error) {
 	var resp EnrollResponse
-	return c.post("/api/fleet/enroll", req, &resp)
+	err := c.post("/api/fleet/enroll", req, &resp)
+	return resp, err
+}
+
+// SendReports uploads a batch of buffered reports. The response names exactly
+// which report ids the control plane now holds, so the caller only clears
+// those from its outbox.
+func (c *Client) SendReports(batch ReportBatch) (ReportBatchResponse, error) {
+	var resp ReportBatchResponse
+	err := c.post("/api/fleet/reports", batch, &resp)
+	return resp, err
 }
 
 // Heartbeat reports current liveness/status/counters and returns the
@@ -88,13 +147,33 @@ func (c *Client) do(httpReq *http.Request, path string, out any) error {
 	if c.token != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	if c.credential != "" {
+		httpReq.Header.Set(CredentialHeader, c.credential)
+	}
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusForbidden && isRevocationBody(resp.Body) {
+			return ErrCredentialRevoked
+		}
 		return fmt.Errorf("fleet %s: %s", path, resp.Status)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// isRevocationBody recognizes the control plane's stable revocation token, so
+// a Sentinel can tell "my identity was revoked" apart from a generic
+// rejection. That distinction is what lets it report the state locally
+// instead of retrying forever as if the network were at fault.
+func isRevocationBody(body io.Reader) bool {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(io.LimitReader(body, 1<<12)).Decode(&payload); err != nil {
+		return false
+	}
+	return payload.Error == ErrorCredentialRevoked
 }
