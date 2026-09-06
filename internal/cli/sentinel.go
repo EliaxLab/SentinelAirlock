@@ -76,14 +76,15 @@ func fleetEnrollBackoffBase() time.Duration {
 
 func sentinelCmd() *cobra.Command {
 	var (
-		repoPath   string
-		policyPath string
-		policyPack string
-		background bool
-		status     bool
-		stop       bool
-		managed    bool
-		fo         fleetOptions
+		repoPath     string
+		policyPath   string
+		policyPack   string
+		background   bool
+		status       bool
+		stop         bool
+		managed      bool
+		fo           fleetOptions
+		fleetHistory bool
 	)
 
 	cmd := &cobra.Command{
@@ -142,6 +143,11 @@ against a Sentinel session with no separate inspection stack.`,
 				return nil
 			}
 
+			// --fleet-history is expressed positively to the operator and
+			// stored negatively internally, so the zero value of
+			// fleetOptions means "history on" and nothing silently opts out.
+			fo.HistorySyncDisabled = !fleetHistory
+
 			if background {
 				return startSentinelBackground(repoAbs, policyPath, policyPack, fo)
 			}
@@ -163,6 +169,7 @@ against a Sentinel session with no separate inspection stack.`,
 	cmd.Flags().StringVar(&fo.EnrollToken, "fleet-enroll-token", "", "One-time enrollment token from 'airlock fleet enroll-token create' (first enrollment only)")
 	cmd.Flags().StringVar(&fo.PublicKey, "fleet-pubkey", "", "Pin the control plane's policy signing key explicitly (hex key, or a path to a file containing it)")
 	cmd.Flags().StringVar(&fo.CACert, "fleet-ca", "", "PEM bundle to trust for an https:// control plane behind a private CA")
+	cmd.Flags().BoolVar(&fleetHistory, "fleet-history", true, "Contribute governance session history metadata to Fleet (health heartbeat and local enforcement are unaffected either way)")
 	return cmd
 }
 
@@ -392,6 +399,14 @@ type fleetOptions struct {
 	// CACert optionally adds a PEM trust anchor for a self-hosted control
 	// plane behind a private CA or self-signed certificate.
 	CACert string
+
+	// HistorySyncDisabled stops this Sentinel contributing governance session
+	// history to Fleet (Prompt 14C). It suppresses HISTORY ONLY: enrollment,
+	// health heartbeat, policy reconciliation, and local enforcement all
+	// continue exactly as before, so turning history off never quietly turns
+	// off fleet health monitoring. Raw evidence was never uploaded in the
+	// first place and is unaffected.
+	HistorySyncDisabled bool
 }
 
 func (o fleetOptions) enabled() bool { return strings.TrimSpace(o.URL) != "" }
@@ -745,6 +760,42 @@ func (s *sentinelSession) stopFleet() {
 	case <-s.fleetDone:
 	case <-time.After(fleet.ClientTimeout + time.Second):
 	}
+	// Report the clean stop only after the fleet goroutine has exited, so
+	// this final heartbeat cannot race an in-flight one and arrive out of
+	// order. Everything here is best-effort and bounded: local shutdown must
+	// succeed whether or not a control plane is reachable.
+	s.reportSessionStopped()
+}
+
+// reportSessionStopped tells Fleet this monitoring session ended cleanly
+// (Prompt 14C).
+//
+// Two delivery paths, because a Sentinel is often stopped precisely when the
+// control plane is unavailable:
+//
+//   - live: a final heartbeat with Status=stopped, which Fleet records as
+//     stopped_at immediately
+//   - buffered: if that fails, a durable SESSION_STOPPED report in the
+//     existing outbox, which a LATER session flushes on reconnect -- the
+//     stopping session is gone, but its outbox is on disk and its session id
+//     is in the report
+//
+// Both converge on the same record: MarkStopped is first-write-wins, so a
+// stop delivered twice records one stopped_at rather than contradicting
+// itself. If neither path ever succeeds, the session is honestly left
+// INTERRUPTED rather than being given a fabricated clean stop.
+func (s *sentinelSession) reportSessionStopped() {
+	if s.fleetClient == nil || s.sentinelID == "" || s.fleetOpts.HistorySyncDisabled {
+		return
+	}
+	stoppedAt := time.Now().UTC()
+	req := s.buildHeartbeatRequest()
+	req.Status = fleet.SessionStoppedStatus
+	if _, err := s.fleetClient.Heartbeat(req); err == nil {
+		return
+	}
+	s.bufferReport(fleet.ReportSessionStopped, stoppedAt, "", "session stopped cleanly")
+	fmt.Printf("Fleet unreachable at shutdown; buffered the session-stop record for delivery on reconnect.\n")
 }
 
 // fleetLoop enrolls (with a bounded, exponentially-backed-off burst of
@@ -766,7 +817,9 @@ func (s *sentinelSession) fleetLoop() {
 	// answer at all.
 	s.writeFleetStatus("")
 	enrolled := s.fleetTryEnroll()
-	s.setConnected(enrolled)
+	if s.getIdentityState() != "REVOKED" {
+		s.setConnected(enrolled)
+	}
 	s.writeFleetStatus("")
 	ticker := time.NewTicker(fleetHeartbeatInterval())
 	defer ticker.Stop()
@@ -800,7 +853,13 @@ func (s *sentinelSession) fleetLoop() {
 				// ask what this machine is still enforcing and how much it has
 				// buffered. Leaving it frozen at the last successful heartbeat
 				// would answer that question with stale information.
-				s.setConnected(false)
+				//
+				// A revoked credential is NOT a connectivity failure -- the
+				// control plane answered, it just refused us. Reporting that
+				// as UNREACHABLE would blame the network for an authorization
+				// decision, and those call for completely different responses
+				// from whoever is reading the status.
+				s.setConnected(errors.Is(err, fleet.ErrCredentialRevoked))
 				s.writeFleetStatus(err.Error())
 				continue
 			}
@@ -901,9 +960,22 @@ func (s *sentinelSession) persistPinnedKey(resp fleet.EnrollResponse) {
 func (s *sentinelSession) fleetTryEnroll() bool {
 	backoff := fleetEnrollBackoffBase()
 	for attempt := 0; attempt < fleet.MaxEnrollAttempts; attempt++ {
-		if _, err := s.enrollOnce(); err == nil {
+		_, err := s.enrollOnce()
+		if err == nil {
 			return true
-		} else if attempt == 0 {
+		}
+		if errors.Is(err, fleet.ErrCredentialRevoked) {
+			// A revoked credential is a settled state, not a transient
+			// failure: retrying the burst cannot fix it, and it must be
+			// classified here rather than only once the first heartbeat runs
+			// -- otherwise a restarted, revoked Sentinel would report itself
+			// AUTHENTICATED and UNREACHABLE for the whole backoff window,
+			// which is wrong on both counts.
+			s.noteFleetError(err)
+			s.setConnected(true)
+			return false
+		}
+		if attempt == 0 {
 			fmt.Printf("WARN: fleet enrollment did not succeed (%v); Sentinel continues local governance and will keep retrying.\n", err)
 		}
 		select {
@@ -969,6 +1041,11 @@ func (s *sentinelSession) buildHeartbeatRequest() fleet.HeartbeatRequest {
 		SignatureState:    s.getSignatureState(),
 		SignerKeyID:       s.getSignerKeyID(),
 		BufferedReports:   s.bufferedReportCount(),
+		// Governance session history (Prompt 14C). StartedAt is this
+		// session's start, so the control plane can record when the session
+		// began without a separate session-registration call.
+		SessionStartedAt:    s.startedAt,
+		HistorySyncDisabled: s.fleetOpts.HistorySyncDisabled,
 	}
 }
 

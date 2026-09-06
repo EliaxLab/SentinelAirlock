@@ -62,6 +62,14 @@ const (
 	ReportDowngradeRejected = "DOWNGRADE_REJECTED"
 	ReportCredentialRevoked = "CREDENTIAL_REVOKED"
 	ReportSessionStarted    = "SESSION_STARTED"
+
+	// ReportSessionStopped is how a clean shutdown reaches Fleet when the
+	// control plane was unreachable at the moment it happened (Prompt 14C).
+	// It rides the existing durable, bounded, deduplicated outbox rather than
+	// a second mechanism, so a Sentinel that stops during an outage still
+	// gets an accurate STOPPED record once something reconnects -- flushed by
+	// a later session, since the one that stopped is gone.
+	ReportSessionStopped = "SESSION_STOPPED"
 )
 
 // Report is one metadata-only fleet alert from a Sentinel.

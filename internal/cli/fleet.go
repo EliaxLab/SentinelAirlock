@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -38,6 +39,8 @@ func fleetCmd() *cobra.Command {
 	cmd.AddCommand(fleetEnrollTokenCmd())
 	cmd.AddCommand(fleetRevokeCmd())
 	cmd.AddCommand(fleetAlertsCmd())
+	cmd.AddCommand(fleetSessionsCmd())
+	cmd.AddCommand(fleetSessionShowCmd())
 	return cmd
 }
 
@@ -104,9 +107,10 @@ Running this twice is safe: an existing key is loaded, not replaced.`,
 }
 
 func fleetServeCmd() *cobra.Command {
-	var listen, dbPath, policyDBPath, authDBPath, alertDBPath, keyPath, token string
+	var listen, dbPath, policyDBPath, authDBPath, alertDBPath, sessionDBPath, keyPath, token string
 	var tlsCert, tlsKey string
 	var requireEnrollment bool
+	var historyMaxSessions, historyMaxAgeDays int
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the Airlock Fleet control plane",
@@ -161,6 +165,9 @@ init'). The private key is never printed and never exposed through any API.`,
 			if strings.TrimSpace(alertDBPath) == "" {
 				alertDBPath = filepath.Join(dir, "fleet-alerts.json")
 			}
+			if strings.TrimSpace(sessionDBPath) == "" {
+				sessionDBPath = filepath.Join(dir, "fleet-sessions.json")
+			}
 			if strings.TrimSpace(keyPath) == "" {
 				keyPath = defaultFleetSigningKeyPath()
 			}
@@ -180,6 +187,14 @@ init'). The private key is never printed and never exposed through any API.`,
 			if err != nil {
 				return fmt.Errorf("could not open fleet alert store %s: %w", alertDBPath, err)
 			}
+			retention := fleet.DefaultRetention()
+			retention.MaxSessionsPerSentinel = historyMaxSessions
+			retention.MaxAge = time.Duration(historyMaxAgeDays) * 24 * time.Hour
+			retention.Enabled = historyMaxSessions > 0 || historyMaxAgeDays > 0
+			sessionStore, err := fleet.OpenSessionStore(sessionDBPath, retention)
+			if err != nil {
+				return fmt.Errorf("could not open fleet session store %s: %w", sessionDBPath, err)
+			}
 			signingKey, createdKey, err := fleet.LoadOrCreateSigningKey(keyPath)
 			if err != nil {
 				return fmt.Errorf("could not load fleet signing key %s: %w", keyPath, err)
@@ -195,6 +210,7 @@ init'). The private key is never printed and never exposed through any API.`,
 			srv := fleet.NewServerWithOptions(store, policyStore, token, fleet.ServerOptions{
 				AuthStore:         authStore,
 				AlertStore:        alertStore,
+				SessionStore:      sessionStore,
 				SigningKey:        signingKey,
 				RequireEnrollment: requireEnrollment,
 			})
@@ -209,6 +225,13 @@ init'). The private key is never printed and never exposed through any API.`,
 			fmt.Printf("Policy store: %s\n", policyDBPath)
 			fmt.Printf("Auth store:   %s\n", authDBPath)
 			fmt.Printf("Alert store:  %s\n", alertDBPath)
+			fmt.Printf("Session store: %s\n", sessionDBPath)
+			if retention.Enabled {
+				fmt.Printf("History:      keep newest %d sessions/Sentinel, max age %d days (Fleet METADATA only --\n", retention.MaxSessionsPerSentinel, historyMaxAgeDays)
+				fmt.Println("              never deletes local .airlock/runs evidence, policy, or credentials)")
+			} else {
+				fmt.Println("History:      retention disabled -- session metadata grows without bound")
+			}
 			fmt.Printf("Signing key:  %s (key id %s)\n", keyPath, signingKey.KeyID)
 			if createdKey {
 				fmt.Println("              (generated just now; distribute the .pub file to pin it on Sentinels)")
@@ -241,6 +264,9 @@ init'). The private key is never printed and never exposed through any API.`,
 	cmd.Flags().StringVar(&policyDBPath, "policy-db", "", "Fleet policy storage path (default: fleet-policies.json next to --db)")
 	cmd.Flags().StringVar(&authDBPath, "auth-db", "", "Enrollment token/credential storage path (default: fleet-auth.json next to --db)")
 	cmd.Flags().StringVar(&alertDBPath, "alert-db", "", "Fleet alert storage path (default: fleet-alerts.json next to --db)")
+	cmd.Flags().StringVar(&sessionDBPath, "session-db", "", "Fleet session-history storage path (default: fleet-sessions.json next to --db)")
+	cmd.Flags().IntVar(&historyMaxSessions, "history-max-sessions", fleet.DefaultMaxSessionsPerSentinel, "Retain at most this many sessions per Sentinel (0 disables the count bound)")
+	cmd.Flags().IntVar(&historyMaxAgeDays, "history-max-age-days", int(fleet.DefaultMaxSessionAge/(24*time.Hour)), "Drop session metadata older than this many days (0 disables the age bound)")
 	cmd.Flags().StringVar(&keyPath, "signing-key", "", "Policy signing key path (default ~/.airlock/fleet-signing-key; created if absent)")
 	cmd.Flags().StringVar(&token, "token", "", "Optional shared operator token")
 	cmd.Flags().BoolVar(&requireEnrollment, "require-enrollment", false, "Require a one-time enrollment token and per-Sentinel credentials (production posture)")
@@ -842,5 +868,181 @@ and remains authoritative there ('airlock inspect/replay/verify').`,
 	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
 	cmd.Flags().StringVar(&token, "token", "", "Fleet operator token")
 	cmd.Flags().IntVar(&limit, "limit", 30, "How many recent alerts to show")
+	return cmd
+}
+
+// --- Governance session history CLI (Prompt 14C) ----------------------------
+//
+// Deliberately usable without the browser UI: an operator on a terminal gets
+// the same facts the web view shows, including the evidence-locality answer.
+
+func fleetSessionsCmd() *cobra.Command {
+	var fleetURL, token, sentinelID string
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "sessions",
+		Short: "List governance sessions across the fleet, or for one Sentinel",
+		Long: `Lists Sentinel monitoring sessions Fleet has recorded.
+
+A Sentinel is a durable identity that outlives any single session: restarting
+it starts a new session and keeps the same sentinel_id, so history accumulates
+rather than resetting.
+
+Fleet stores session METADATA only. Raw evidence -- events, diffs, patches,
+file contents -- never leaves the machine that produced it and stays
+authoritative there ('airlock inspect/replay/verify <session-id>').`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/api/fleet/sessions"
+			if strings.TrimSpace(sentinelID) != "" {
+				path += "?sentinel=" + url.QueryEscape(sentinelID)
+			}
+			var resp fleet.SessionListResponse
+			if err := fleetGet(fleetURL, token, path, &resp); err != nil {
+				return err
+			}
+			if len(resp.Sessions) == 0 {
+				fmt.Println("No governance sessions recorded yet.")
+				return nil
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+			fmt.Fprintln(w, "SESSION\tSENTINEL\tSTATE\tPOLICY\tSIGNATURE\tSTARTED\tENDED\tLAST SEEN\tA/D/R/F")
+			shown := 0
+			for _, v := range resp.Sessions {
+				if limit > 0 && shown >= limit {
+					break
+				}
+				shown++
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d/%d/%d/%d\n",
+					shortFleetID(v.SessionID), shortFleetID(v.SentinelID), sessionStateLabel(v),
+					policyRefLabel(v.PolicyID, v.PolicyVersion), dashIfEmpty(v.SignatureState),
+					fleet.FormatAge(v.StartedAt), sessionEndedLabel(v), fleet.FormatAge(v.LastSeenAt),
+					v.AllowCount, v.DenyCount, v.RevertedCount, v.RevertFailedCount)
+			}
+			_ = w.Flush()
+			if resp.Totals != nil {
+				fmt.Printf("\n%d session(s) retained for this Sentinel -- allow %d, deny %d, reverted %d, revert failed %d\n",
+					resp.Totals.SessionCount, resp.Totals.AllowCount, resp.Totals.DenyCount,
+					resp.Totals.RevertedCount, resp.Totals.RevertFailedCount)
+				fmt.Println("(totals are derived from the retained sessions above, not an all-time counter)")
+			}
+			fmt.Println("\nRaw evidence remains local to each Sentinel. Fleet holds metadata only.")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet operator token")
+	cmd.Flags().StringVar(&sentinelID, "sentinel", "", "Only show sessions for this Sentinel")
+	cmd.Flags().IntVar(&limit, "limit", 40, "Maximum sessions to display (0 for all)")
+	return cmd
+}
+
+// sessionStateLabel renders CURRENT vs HISTORICAL alongside the lifecycle
+// state, so the distinction the UI makes is equally clear on a terminal.
+func sessionStateLabel(v fleet.SessionView) string {
+	if v.Current {
+		return "CURRENT/ACTIVE"
+	}
+	return "HIST/" + v.Status
+}
+
+func sessionEndedLabel(v fleet.SessionView) string {
+	if v.StoppedAt != nil {
+		return fleet.FormatAge(*v.StoppedAt)
+	}
+	if v.Status == fleet.SessionInterrupted {
+		return "no clean stop"
+	}
+	return "-"
+}
+
+func shortFleetID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+func fleetSessionShowCmd() *cobra.Command {
+	var fleetURL, token string
+	cmd := &cobra.Command{
+		Use:   "session <session-id>",
+		Short: "Show one governance session in detail",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// A blank id would address the collection route rather than a
+			// session, and the list response decodes into the detail struct as
+			// zero values -- printing a convincing, entirely empty session.
+			// Refuse it here rather than render nothing as if it were something.
+			sessionID := strings.TrimSpace(args[0])
+			if sessionID == "" {
+				return fmt.Errorf("a session id is required (see 'airlock fleet sessions')")
+			}
+			var detail struct {
+				fleet.SessionView
+				Alerts []fleet.Report `json:"alerts"`
+			}
+			if err := fleetGet(fleetURL, token, "/api/fleet/sessions/"+url.PathEscape(sessionID), &detail); err != nil {
+				return err
+			}
+			if detail.SessionID == "" {
+				return fmt.Errorf("session %s not found", sessionID)
+			}
+			v := detail.SessionView
+			fmt.Printf("Session:     %s\n", v.SessionID)
+			fmt.Printf("State:       %s\n", sessionStateLabel(v))
+			fmt.Printf("Sentinel:    %s\n", v.SentinelID)
+			if v.MachineID != "" {
+				fmt.Printf("Machine:     %s\n", v.MachineID)
+			}
+			fmt.Printf("Repository:  %s\n", dashIfEmpty(v.RepoPath))
+			if v.Hostname != "" {
+				fmt.Printf("Hostname:    %s\n", v.Hostname)
+			}
+			fmt.Printf("Version:     %s\n", dashIfEmpty(v.SentinelVersion))
+			fmt.Println()
+			fmt.Printf("Started:     %s\n", v.StartedAt.Format(time.RFC3339))
+			if v.StoppedAt != nil {
+				fmt.Printf("Stopped:     %s (clean shutdown reported)\n", v.StoppedAt.Format(time.RFC3339))
+			} else if v.Status == fleet.SessionInterrupted {
+				fmt.Println("Stopped:     no clean stop was ever reported")
+			}
+			fmt.Printf("Last seen:   %s\n", v.LastSeenAt.Format(time.RFC3339))
+			fmt.Println()
+			fmt.Printf("Policy:      %s\n", policyRefLabel(v.PolicyID, v.PolicyVersion))
+			fmt.Printf("Policy hash: %s\n", dashIfEmpty(v.PolicyHash))
+			fmt.Printf("Signature:   %s\n", dashIfEmpty(v.SignatureState))
+			fmt.Printf("Signer:      %s\n", dashIfEmpty(v.SignerKeyID))
+			fmt.Println("(what this session actually enforced; unchanged by later policy assignments)")
+			fmt.Println()
+			fmt.Printf("Allowed:     %d\nDenied:      %d\nReverted:    %d\nRevert fail: %d\n",
+				v.AllowCount, v.DenyCount, v.RevertedCount, v.RevertFailedCount)
+			if v.LastEventAt != nil {
+				fmt.Printf("Last event:  %s\n", v.LastEventAt.Format(time.RFC3339))
+			}
+			fmt.Println()
+			fmt.Printf("Evidence:    %s TO SENTINEL (%s)\n", v.Evidence.Location, v.Evidence.Kind)
+			fmt.Printf("             Fleet holds metadata only -- no contents, diffs, or event logs.\n")
+			fmt.Printf("             On the Sentinel's own machine: airlock inspect %s\n", v.SessionID)
+			if v.Status == fleet.SessionInterrupted {
+				fmt.Println()
+				fmt.Println("NOTE: this session stopped reporting without a clean shutdown. Fleet knows only")
+				fmt.Println("      that it stopped hearing from it. That does NOT mean local governance stopped --")
+				fmt.Println("      a disconnected or revoked Sentinel keeps enforcing its last-known-good policy.")
+			}
+			if len(detail.Alerts) > 0 {
+				fmt.Println()
+				fmt.Println("Governance alerts for this session:")
+				w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+				fmt.Fprintln(w, "  WHEN\tTYPE\tPATH\tDETAIL")
+				for _, a := range detail.Alerts {
+					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", fleet.FormatAge(a.At), a.Type, dashIfEmpty(a.Path), a.Summary)
+				}
+				_ = w.Flush()
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet operator token")
 	return cmd
 }
