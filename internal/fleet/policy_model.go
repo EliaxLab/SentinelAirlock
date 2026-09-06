@@ -17,9 +17,11 @@ import (
 // already knows how to load locally, so applying a fetched PolicyVersion
 // requires no new parsing logic, only a new source for it.
 //
-// Prepared for Prompt 14B without a destructive redesign: Signature/Issuer/
-// IssuedAt are reserved (json-omitted while empty) rather than bolted on
-// later as a schema migration.
+// Trust fields (Prompt 14B) were reserved by 14A and are now populated: a
+// version created by a signing-capable control plane carries the full
+// canonical SHA-256 Digest plus the Signature/Issuer/IssuedAt that bind it.
+// Hash remains the short 16-hex display/drift fingerprint -- it is never the
+// digest a signature is computed over. See signing.go.
 type PolicyVersion struct {
 	PolicyID    string    `json:"policy_id"`
 	Version     int       `json:"version"`
@@ -28,11 +30,22 @@ type PolicyVersion struct {
 	Description string    `json:"description,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 
-	// Reserved for Prompt 14B (trust/signing). Deliberately present-but-empty
-	// now so adding real values later is additive, not a schema break.
-	Signature string    `json:"signature,omitempty"`
-	Issuer    string    `json:"issuer,omitempty"`
-	IssuedAt  time.Time `json:"issued_at,omitempty"`
+	// Digest is the full 64-hex SHA-256 of the canonical policy content --
+	// the cryptographic identity of this version's meaning, and what
+	// signatures are computed over. Hash (above) is derived from it purely
+	// for compact display; a truncated hash must never be the only integrity
+	// check standing between a control plane and what a Sentinel enforces.
+	Digest string `json:"digest,omitempty"`
+
+	SignatureAlg string    `json:"signature_alg,omitempty"`
+	Signature    string    `json:"signature,omitempty"`
+	Issuer       string    `json:"issuer,omitempty"`
+	IssuedAt     time.Time `json:"issued_at,omitempty"`
+}
+
+// Signed reports whether this version carries signature material at all.
+func (v PolicyVersion) Signed() bool {
+	return v.Signature != "" && v.Issuer != ""
 }
 
 // PolicyRef names a specific version of a named policy -- what gets assigned
@@ -67,16 +80,59 @@ func (r PolicyRef) Equal(other PolicyRef) bool {
 // it) using the exact same algorithm, so a mismatch reliably indicates
 // either corruption or a version that has genuinely changed.
 func ComputePolicyHash(yamlContent string) (string, *policy.Config, error) {
+	_, short, cfg, err := ComputePolicyDigest(yamlContent)
+	return short, cfg, err
+}
+
+// CanonicalPolicyBytes is the single definition of "the canonical form of
+// this policy": parse the YAML into a policy.Config and re-marshal it to
+// JSON. policy.Config is a struct with no map-typed fields, so encoding/json
+// emits its fields in declaration order and the output is byte-for-byte
+// reproducible -- which is what lets the same bytes be hashed on the control
+// plane and re-derived on a Sentinel to check a signature.
+//
+// Canonicalizing through the parsed config (rather than over raw YAML text)
+// is also what makes whitespace, comments, and key ordering irrelevant: two
+// differently-typed documents with the same effective policy canonicalize
+// identically.
+func CanonicalPolicyBytes(yamlContent string) ([]byte, *policy.Config, error) {
 	var cfg policy.Config
 	if err := yaml.Unmarshal([]byte(yamlContent), &cfg); err != nil {
-		return "", nil, fmt.Errorf("invalid policy document: %w", err)
+		return nil, nil, fmt.Errorf("invalid policy document: %w", err)
 	}
 	b, err := json.Marshal(cfg)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])[:16], &cfg, nil
+	return b, &cfg, nil
+}
+
+// DigestOf returns the full hex SHA-256 of canonical bytes.
+func DigestOf(canonical []byte) string {
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
+}
+
+// ShortHash truncates a full digest to the 16-hex fingerprint used in tables,
+// status output, and drift comparison. It is a display convenience only --
+// see PolicyVersion.Digest for why it is never the sole integrity check.
+func ShortHash(digest string) string {
+	if len(digest) <= 16 {
+		return digest
+	}
+	return digest[:16]
+}
+
+// ComputePolicyDigest parses yamlContent and returns both its full canonical
+// SHA-256 digest (used for signing and integrity) and the short fingerprint
+// (used for display and drift comparison), plus the parsed config.
+func ComputePolicyDigest(yamlContent string) (digest, short string, cfg *policy.Config, err error) {
+	canonical, parsed, err := CanonicalPolicyBytes(yamlContent)
+	if err != nil {
+		return "", "", nil, err
+	}
+	digest = DigestOf(canonical)
+	return digest, ShortHash(digest), parsed, nil
 }
 
 // ReconcileState derives a Sentinel's policy sync status for display,
@@ -115,10 +171,55 @@ func ReconcileState(rec Record) (status string, errMsg string) {
 	if rec.ReconcileStatus == "RECONCILING" {
 		return "RECONCILING", ""
 	}
-	if rec.ReconcileStatus == "RECONCILE_FAILED" && rec.ReconcileForHash == desired.Hash {
-		return "RECONCILE_FAILED", rec.ReconcileError
+	if isReconcileFailure(rec.ReconcileStatus) && rec.ReconcileForHash == desired.Hash {
+		return rec.ReconcileStatus, rec.ReconcileError
 	}
 	return "DRIFTED", ""
+}
+
+// Reconcile failure statuses. RECONCILE_FAILED is the general case from
+// Prompt 14A; SIGNATURE_INVALID and DOWNGRADE_REJECTED (Prompt 14B) are
+// deliberately distinct rather than folded into it, because they mean
+// something categorically different to an operator: not "this didn't work,
+// retry," but "a Sentinel refused this policy on trust grounds." Those two
+// deserve to be visible as themselves in the fleet UI, not buried in an
+// error string.
+const (
+	ReconcileFailed    = "RECONCILE_FAILED"
+	SignatureInvalid   = "SIGNATURE_INVALID"
+	DowngradeRejected  = "DOWNGRADE_REJECTED"
+	ReconcileInProcess = "RECONCILING"
+)
+
+func isReconcileFailure(status string) bool {
+	switch status {
+	case ReconcileFailed, SignatureInvalid, DowngradeRejected:
+		return true
+	}
+	return false
+}
+
+// IdentityState reports the control plane's view of a Sentinel's Fleet
+// identity, computed rather than stored (the same principle Health and
+// ReconcileState follow):
+//
+//   - REVOKED: this Sentinel's credential has been revoked by an operator. It
+//     can no longer participate in Fleet. It is expected to keep enforcing
+//     its last-known-good policy locally -- revocation removes a Sentinel
+//     from the control plane, it does not disable local protection. See
+//     progress.md's Prompt 14B handoff for the full semantics.
+//   - AUTHENTICATED: an active per-Sentinel credential exists.
+//   - UNAUTHENTICATED: no credential has ever been issued for this Sentinel
+//     (a pre-14B or development-posture Sentinel reporting without one).
+func IdentityState(rec Record) string {
+	switch {
+	case rec.Revoked:
+		return "REVOKED"
+	case rec.CredentialIssued:
+		return "AUTHENTICATED"
+	default:
+		return "UNAUTHENTICATED"
+	}
 }
 
 func actualVersionAsInt(v string) int {

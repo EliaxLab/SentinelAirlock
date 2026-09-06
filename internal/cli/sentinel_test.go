@@ -48,7 +48,7 @@ func canonicalRepo(t *testing.T, dir string) string {
 func startTestSentinel(t *testing.T, dir string) *sentinelSession {
 	t.Helper()
 	repoAbs := canonicalRepo(t, dir)
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, "", "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: ""})
 	if err != nil {
 		t.Fatalf("startSentinelSession: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestSentinel_RapidWrites_SettleWithoutCorruption(t *testing.T) {
 func TestSentinel_ShutdownFinalizesEvidence(t *testing.T) {
 	dir := chdirTempRepo(t)
 	repoAbs := canonicalRepo(t, dir)
-	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, "", "")
+	sess, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: ""})
 	if err != nil {
 		t.Fatalf("startSentinelSession: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestSentinel_RepoResolution_RelativeAndAbsoluteEquivalent(t *testing.T) {
 func TestSentinel_RestartEstablishesFreshBaseline(t *testing.T) {
 	dir := chdirTempRepo(t)
 	repoAbs := canonicalRepo(t, dir)
-	sess1, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, "", "")
+	sess1, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +579,7 @@ func TestSentinel_RestartEstablishesFreshBaseline(t *testing.T) {
 
 	// New session should seed its baseline from the CURRENT real state (v1),
 	// not fail or reset anything.
-	sess2, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, "", "")
+	sess2, err := startSentinelSession(repoAbs, filepath.Join(repoAbs, "airlock.yaml"), "", false, fleetOptions{URL: ""})
 	if err != nil {
 		t.Fatalf("second session failed to start: %v", err)
 	}
