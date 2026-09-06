@@ -142,7 +142,31 @@ type HeartbeatRequest struct {
 	SignatureState  string `json:"signature_state,omitempty"`
 	SignerKeyID     string `json:"signer_key_id,omitempty"`
 	BufferedReports int    `json:"buffered_reports,omitempty"`
+
+	// Governance session history (Prompt 14C). The heartbeat already carried
+	// everything a session record needs except when the session began, so
+	// history rides the existing authenticated loop rather than adding a
+	// second synchronization channel.
+	//
+	// SessionStartedAt is this monitoring session's start. It is sticky
+	// server-side: a later heartbeat that omits it never blanks it.
+	SessionStartedAt time.Time `json:"session_started_at,omitempty"`
+
+	// HistorySyncDisabled suppresses governance-history metadata only. It is
+	// phrased negatively on purpose: the zero value means history sync is ON,
+	// so a pre-14C Sentinel and a default-configured one behave identically.
+	//
+	// Operational heartbeat is deliberately NOT affected by this flag --
+	// health, drift, and policy state keep working. Turning off history must
+	// not quietly turn off fleet health monitoring; those are different
+	// concerns and this is the line between them.
+	HistorySyncDisabled bool `json:"history_sync_disabled,omitempty"`
 }
+
+// SessionStoppedStatus is the Status value a Sentinel sends on its final
+// heartbeat to report a clean shutdown. Anything else leaves the session's
+// stopped_at unset -- Fleet never infers a clean stop it was not told about.
+const SessionStoppedStatus = "stopped"
 
 // HeartbeatResponse acknowledges a heartbeat and carries the Sentinel's
 // current desired policy, if one has been assigned (Prompt 14A). An empty

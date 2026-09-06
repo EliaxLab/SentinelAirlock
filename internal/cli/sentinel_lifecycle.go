@@ -153,6 +153,9 @@ func startSentinelBackground(repoAbs, policyPath, policyPack string, fo fleetOpt
 	if fo.CACert != "" {
 		args = append(args, "--fleet-ca", fo.CACert)
 	}
+	if fo.HistorySyncDisabled {
+		args = append(args, "--fleet-history=false")
+	}
 
 	cmd := exec.Command(self, args...)
 	cmd.Stdout = logFile
@@ -232,7 +235,11 @@ func printFleetTrustStatus(repoAbs string) {
 	fmt.Println()
 	fmt.Println("Fleet")
 	reach := "reachable"
-	if !st.Connected {
+	switch {
+	case st.Identity == "REVOKED" && st.Connected:
+		// Reached it; it refused us. Say that, rather than blaming the network.
+		reach = "reachable, but rejecting this Sentinel's credential"
+	case !st.Connected:
 		reach = "UNREACHABLE -- local governance continues regardless"
 	}
 	fmt.Printf("  Control plane:   %s (%s)\n", st.FleetURL, reach)

@@ -26,12 +26,13 @@ import (
 //   - no OAuth/OIDC/SAML, no RBAC beyond the operator/Sentinel split, no
 //     HSM/KMS, no certificate authority
 type Server struct {
-	store       *Store
-	policyStore *PolicyStore
-	authStore   *AuthStore
-	alertStore  *AlertStore
-	signingKey  *SigningKey
-	token       string
+	store        *Store
+	policyStore  *PolicyStore
+	authStore    *AuthStore
+	alertStore   *AlertStore
+	sessionStore *SessionStore
+	signingKey   *SigningKey
+	token        string
 
 	// requireEnrollment selects the trust posture. See ServerOptions.
 	requireEnrollment bool
@@ -54,6 +55,11 @@ type ServerOptions struct {
 
 	// SigningKey signs policy versions and rollback grants.
 	SigningKey *SigningKey
+
+	// SessionStore retains governance session history (Prompt 14C). With no
+	// SessionStore, heartbeats still work exactly as before and no history is
+	// recorded -- history is additive, never a precondition for health.
+	SessionStore *SessionStore
 
 	// RequireEnrollment is the production posture: every Sentinel endpoint
 	// demands a valid per-Sentinel credential, and first enrollment demands a
@@ -84,6 +90,7 @@ func NewServerWithOptions(store *Store, policyStore *PolicyStore, token string, 
 		policyStore:       policyStore,
 		authStore:         opts.AuthStore,
 		alertStore:        opts.AlertStore,
+		sessionStore:      opts.SessionStore,
 		signingKey:        opts.SigningKey,
 		token:             strings.TrimSpace(token),
 		requireEnrollment: opts.RequireEnrollment,
@@ -105,8 +112,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/fleet/trust", s.handleTrust)
 	mux.HandleFunc("/api/fleet/enroll-tokens", s.handleEnrollTokens)
 	mux.HandleFunc("/api/fleet/enroll-tokens/", s.handleEnrollTokenSub)
+	mux.HandleFunc("/api/fleet/sessions", s.handleSessionsList)
+	mux.HandleFunc("/api/fleet/sessions/", s.handleSessionDetail)
 	mux.HandleFunc("/api/fleet/sentinels", s.handleList)
 	mux.HandleFunc("/api/fleet/sentinels/", s.handleDetailAPI)
+	mux.HandleFunc("/fleet/sessions/", s.handleSessionPage)
 	mux.HandleFunc("/api/fleet/policies", s.handlePoliciesRoot)
 	mux.HandleFunc("/api/fleet/policies/", s.handlePoliciesSub)
 	mux.HandleFunc("/fleet/sentinels/", s.handleDetailPage)
@@ -419,6 +429,22 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not persist heartbeat", http.StatusInternalServerError)
 		return
 	}
+
+	// Governance session history (Prompt 14C). Recorded from the same
+	// authenticated heartbeat that already carries everything a session row
+	// needs -- no second synchronization loop, and no extra round trip.
+	//
+	// A failure here is deliberately NOT fatal to the heartbeat: history is
+	// valuable, but fleet health is what an operator depends on minute to
+	// minute, and losing liveness because a metadata write failed would be
+	// the wrong trade.
+	if err := s.recordSessionHistory(req, rec, now); err != nil {
+		if errors.Is(err, ErrSessionOwnedByAnotherSentinel) {
+			http.Error(w, "session belongs to a different sentinel", http.StatusForbidden)
+			return
+		}
+	}
+
 	writeJSON(w, HeartbeatResponse{
 		Accepted:             true,
 		DesiredPolicyID:      rec.DesiredPolicyID,
@@ -427,6 +453,55 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		DesiredPolicyDigest:  rec.DesiredPolicyDigest,
 		RollbackGrant:        rec.RollbackGrant,
 	})
+}
+
+// recordSessionHistory upserts the reporting Sentinel's current session, and
+// records a clean stop when the heartbeat says so.
+//
+// req.SentinelID is safe to use here only because handleHeartbeat has already
+// run requireSentinel against it -- the value has been proven to match the
+// authenticated principal. The session store checks ownership again on the
+// row itself, so the invariant survives even if a future caller forgets the
+// first gate.
+func (s *Server) recordSessionHistory(req HeartbeatRequest, rec Record, now time.Time) error {
+	if s.sessionStore == nil || req.SessionID == "" {
+		return nil
+	}
+	if req.HistorySyncDisabled {
+		// The Sentinel has history sync turned off. Its heartbeat still
+		// maintains present state above (health, drift, policy) -- only the
+		// historical record is suppressed, which is exactly the split the
+		// operator asked for.
+		return nil
+	}
+	if _, err := s.sessionStore.Upsert(req.SentinelID, SessionUpdate{
+		SessionID:       req.SessionID,
+		MachineID:       rec.MachineID,
+		RepoPath:        rec.RepoPath,
+		Hostname:        rec.Hostname,
+		SentinelVersion: req.SentinelVersion,
+		StartedAt:       req.SessionStartedAt,
+		// Policy/trust state as THIS session reports it, frozen into this
+		// session's row -- never re-derived later from desired state.
+		PolicyID:          req.PolicyID,
+		PolicyVersion:     req.PolicyVersion,
+		PolicyHash:        req.PolicyHash,
+		SignatureState:    req.SignatureState,
+		SignerKeyID:       req.SignerKeyID,
+		AllowCount:        req.AllowCount,
+		DenyCount:         req.DenyCount,
+		RevertedCount:     req.RevertedCount,
+		RevertFailedCount: req.RevertFailedCount,
+		LastEventAt:       req.LastEventAt,
+	}, now); err != nil {
+		return err
+	}
+	if req.Status == SessionStoppedStatus {
+		if _, err := s.sessionStore.MarkStopped(req.SentinelID, req.SessionID, now, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // handleReports ingests a batch of buffered Sentinel reports (Prompt 14B).
@@ -461,12 +536,163 @@ func (s *Server) handleReports(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "report batch too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	// A buffered SESSION_STOPPED is how a clean shutdown that happened during
+	// a control-plane outage reaches Fleet (Prompt 14C). It is applied to
+	// session history here, under the authenticated principal, before the
+	// batch is stored as alerts -- so a Sentinel that stopped while Fleet was
+	// down ends up STOPPED rather than permanently INTERRUPTED.
+	//
+	// MarkStopped is first-write-wins, so this and a live final heartbeat
+	// reporting the same stop converge on one stopped_at.
+	if s.sessionStore != nil {
+		for _, r := range batch.Reports {
+			if r.Type != ReportSessionStopped || r.SessionID == "" {
+				continue
+			}
+			if _, err := s.sessionStore.MarkStopped(p.SentinelID, r.SessionID, r.At, time.Now().UTC()); err != nil {
+				if errors.Is(err, ErrSessionOwnedByAnotherSentinel) {
+					http.Error(w, "session belongs to a different sentinel", http.StatusForbidden)
+					return
+				}
+			}
+		}
+	}
+
 	resp, err := s.alertStore.Ingest(p.SentinelID, batch.Reports)
 	if err != nil {
 		http.Error(w, "could not persist reports", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, resp)
+}
+
+// --- Governance session history APIs (Prompt 14C) ---------------------------
+//
+// Read-only and operator-authenticated. Sessions are mutated only by their
+// own Sentinel, through the authenticated heartbeat and report paths above --
+// there is no operator write path into history, and no endpoint anywhere that
+// returns evidence contents or a filesystem path Fleet could open.
+
+// SessionListResponse is the history listing, newest first.
+type SessionListResponse struct {
+	Now      time.Time     `json:"now"`
+	Sessions []SessionView `json:"sessions"`
+
+	// Totals is present when the listing is scoped to one Sentinel, and is
+	// always derived by summing the rows returned -- never stored separately.
+	Totals *SentinelTotals `json:"totals,omitempty"`
+
+	// Retention describes what bounds this history, so an operator reading a
+	// short list can tell "nothing happened" from "older metadata aged out."
+	Retention RetentionPolicy `json:"retention"`
+}
+
+// handleSessionsList serves GET /api/fleet/sessions[?sentinel=<id>].
+func (s *Server) handleSessionsList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := s.requireOperator(w, r); !ok {
+		return
+	}
+	writeJSON(w, s.sessionsFor(strings.TrimSpace(r.URL.Query().Get("sentinel"))))
+}
+
+// sessionsFor builds the history listing, optionally scoped to one Sentinel.
+func (s *Server) sessionsFor(sentinelID string) SessionListResponse {
+	now := time.Now().UTC()
+	resp := SessionListResponse{Now: now, Sessions: []SessionView{}}
+	if s.sessionStore == nil {
+		return resp
+	}
+	resp.Retention = s.sessionStore.Retention()
+
+	var sessions []FleetSession
+	if sentinelID != "" {
+		sessions = s.sessionStore.ForSentinel(sentinelID)
+		totals := Totals(sessions)
+		resp.Totals = &totals
+	} else {
+		sessions = s.sessionStore.List()
+	}
+	// The "current" session is whichever one each owning Sentinel's own
+	// authenticated heartbeat most recently claimed -- looked up per owner,
+	// never inferred from ordering.
+	current := map[string]string{}
+	for _, sess := range sessions {
+		if _, seen := current[sess.SentinelID]; seen {
+			continue
+		}
+		if rec, ok := s.store.Get(sess.SentinelID); ok {
+			current[sess.SentinelID] = rec.SessionID
+		} else {
+			current[sess.SentinelID] = ""
+		}
+	}
+	for _, sess := range sessions {
+		resp.Sessions = append(resp.Sessions, newSessionView(sess, current[sess.SentinelID], now))
+	}
+	return resp
+}
+
+// handleSessionDetail serves GET /api/fleet/sessions/<session-id>, including
+// the metadata alerts already correlated to that session by Prompt 14B's
+// alert store -- correlation over existing metadata, not a second event
+// system.
+func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := s.requireOperator(w, r); !ok {
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/fleet/sessions/"), "/")
+	if id == "" {
+		s.handleSessionsList(w, r)
+		return
+	}
+	view, alerts, ok := s.sessionDetail(id)
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, struct {
+		SessionView
+		Alerts []Report `json:"alerts"`
+	}{SessionView: view, Alerts: alerts})
+}
+
+func (s *Server) sessionDetail(sessionID string) (SessionView, []Report, bool) {
+	if s.sessionStore == nil {
+		return SessionView{}, nil, false
+	}
+	sess, ok := s.sessionStore.Get(sessionID)
+	if !ok {
+		return SessionView{}, nil, false
+	}
+	currentSessionID := ""
+	rec, found := s.store.Get(sess.SentinelID)
+	if found {
+		currentSessionID = rec.SessionID
+	}
+	// Carry the owning Sentinel's computed identity state onto the session so
+	// the page can be precise about revocation: a revoked Sentinel is out of
+	// the fleet but is still governing its repository, and that must be said
+	// wherever an operator might otherwise read "revoked" as "stopped."
+	identity := IdentityState(s.viewOf(rec, time.Now().UTC()).Record)
+	alerts := []Report{}
+	if s.alertStore != nil {
+		for _, a := range s.alertStore.Recent(MaxStoredAlerts) {
+			if a.SessionID == sessionID {
+				alerts = append(alerts, a)
+			}
+		}
+	}
+	view := newSessionView(sess, currentSessionID, time.Now().UTC())
+	view.OwnerIdentity = identity
+	return view, alerts, true
 }
 
 // handleAlerts serves the recent fleet-wide alert feed to operators.
@@ -646,6 +872,17 @@ func (s *Server) handleDetailAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if id, ok := strings.CutSuffix(rest, "/revoke"); ok {
 		s.handleRevokeSentinel(w, r, id)
+		return
+	}
+	if id, ok := strings.CutSuffix(rest, "/sessions"); ok {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if _, authed := s.requireOperator(w, r); !authed {
+			return
+		}
+		writeJSON(w, s.sessionsFor(id))
 		return
 	}
 	if r.Method != http.MethodGet {
