@@ -12,17 +12,30 @@ Sentinel Airlock is an agent-governance boundary for coding agents. It wraps age
 go install github.com/mirelahmed-commits/SentinelAirlock/cmd/airlock@latest
 ```
 
+Re-running this command is also how you upgrade. Check what you have with `airlock --version`.
+
 ### Option 2 — curl installer (macOS / Linux, no Go required)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mirelahmed-commits/SentinelAirlock/main/scripts/install.sh | bash
 ```
 
-Downloads the prebuilt binary for your OS/arch from the latest GitHub Release and installs it to `/usr/local/bin` (or `~/.local/bin` / `~/bin` if `/usr/local/bin` is not writable). Falls back to building from source if Go is available and no prebuilt binary exists.
+Downloads the prebuilt binary for your OS/arch from the latest GitHub Release and installs it to `/usr/local/bin` (or `~/.local/bin` / `~/bin` if `/usr/local/bin` is not writable). Falls back to building from source if Go is available and no prebuilt binary exists. **macOS/Linux only** — there is no Windows shell equivalent; see Windows below.
+
+**Upgrading:** re-run the exact same command. It always overwrites the same target path, so this is also how you get a newer version later — there's no separate upgrade command.
+
+### Windows
+
+There is no `curl`/bash installer for Windows — don't use WSL/Git Bash's `bash` for this, since `install.sh` explicitly refuses to run on anything but macOS/Linux. Two supported paths instead:
+
+- **Prebuilt binary:** download `airlock-windows-amd64.exe` from the [Releases page](https://github.com/mirelahmed-commits/SentinelAirlock/releases), rename it `airlock.exe`, and put it on your `PATH`. To upgrade, download the new release's `.exe` and overwrite the old file.
+- **Go toolchain:** `go install github.com/mirelahmed-commits/SentinelAirlock/cmd/airlock@latest` (see Option 1 above) — works identically on Windows.
+
+`airlock serve --background` detachment is not supported on Windows; run `airlock serve` in its own terminal there instead.
 
 ### Option 3 — direct binary download
 
-Grab the binary for your platform from the [Releases page](https://github.com/mirelahmed-commits/SentinelAirlock/releases), `chmod +x` it, and put it on your `PATH`.
+Grab the binary for your platform from the [Releases page](https://github.com/mirelahmed-commits/SentinelAirlock/releases), `chmod +x` it, and put it on your `PATH`. To upgrade, download the new release's binary over the old one.
 
 | Platform | Binary |
 |---|---|
@@ -30,6 +43,9 @@ Grab the binary for your platform from the [Releases page](https://github.com/mi
 | macOS (Intel) | `airlock-darwin-amd64` |
 | Linux (x86-64) | `airlock-linux-amd64` |
 | Linux (ARM64) | `airlock-linux-arm64` |
+| Windows (x86-64) | `airlock-windows-amd64.exe` |
+
+Each release also publishes `checksums.txt` (SHA-256) alongside the binaries for manual verification.
 
 ### Build from source (contributors)
 
