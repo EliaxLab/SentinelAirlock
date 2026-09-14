@@ -5,9 +5,11 @@
 - [ ] `make build VERSION=<version>` passes
 - [ ] `./airlock --version` shows version/commit/build date
 - [ ] `./airlock doctor` passes with no BLOCKER lines
-- [ ] 90-second demo path verified from clean state: `rm -rf .airlock && bash samples/demo.sh && ./airlock verify latest`
-- [ ] Governance boundary demo verified: `bash samples/demo-full.sh && ./airlock verify latest`
-- [ ] Rollback demo verified: `bash samples/demo-rollback.sh && ./airlock verify latest`
+- [ ] 90-second demo path verified from clean state: `rm -rf .airlock && bash scripts/dev/demo.sh && ./airlock verify latest`
+- [ ] Governance boundary demo verified: `bash scripts/dev/demo-full.sh && ./airlock verify latest`
+- [ ] Rollback demo verified: `bash scripts/dev/demo-rollback.sh && ./airlock verify latest`
+- [ ] Sentinel smoke test: `airlock sentinel --repo . --background`, one allowed + one denied external write, `--status`, `--stop`
+- [ ] Fleet smoke test: `airlock fleet init` + `fleet serve` + enroll a Sentinel + `fleet policy assign` + confirm `IN_SYNC`/`VERIFIED`
 - [ ] All three demos end with `status=verified-unsigned`
 - [ ] `./airlock export latest --format zip --include-report && ./airlock verify latest` returns `verified-unsigned`
 

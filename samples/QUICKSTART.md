@@ -200,7 +200,7 @@ After rollback:
 - `rollback.json` artifact is written (checkpoint, mode, timestamp, status)
 - `report/index.html` is regenerated to reflect the rollback event
 
-**Limitation (v2.2.0-rc1):** One checkpoint per run (`cp-0`). Operation-level rollback (undo last N operations) is future work.
+**Limitation:** One checkpoint per run (`cp-0`). Operation-level rollback (undo last N operations) is future work.
 
 ---
 

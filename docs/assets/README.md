@@ -2,7 +2,13 @@
 
 Store all public-facing visuals here.
 
-## Naming convention
+## Currently captured (used in README.md)
+
+- `fleet-inventory.png` — Fleet control plane: Sentinel inventory, trust/sync state, recent alerts
+- `sentinel-viewer.png` — Sentinel viewer: repository governance, live activity, session history
+- `session-detail.png` — session detail page: governance outcome, denied writes, next-step actions
+
+## Naming convention (for additional captures)
 
 - `01-terminal-run-summary.png`
 - `02-replay-page.png`

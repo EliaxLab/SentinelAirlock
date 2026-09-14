@@ -2,12 +2,14 @@
 
 ## Current limitations
 
-- **Windows:** `generic-shell` uses PowerShell. macOS/Linux use bash. `--background` viewer detachment is not supported on Windows; use `airlock serve` in a separate terminal.
+- **Windows:** `generic-shell` uses PowerShell. macOS/Linux use bash. `--background` detachment (for `serve` and `sentinel`) is not supported on Windows; run the foreground command in its own terminal there instead.
 - Agent backends (Codex, Claude Code, etc.) must be installed separately.
 - Container mode depends on host runtime/socket permissions.
-- Remote mode uses shared-token auth today; full IAM is out of scope.
-- Some constrained environments block loopback bind for `serve` or `worker`.
+- Remote worker mode uses shared-token auth today; full IAM is out of scope.
+- Some constrained environments block loopback bind for `serve`, `worker`, or `fleet serve`.
 - Network allowlist guarantees are strongest in containerized paths.
+- **Sentinel is userspace, not kernel-level.** Detect → evaluate → revert happens after the OS accepts a write; killing the Sentinel process stops enforcement immediately with no supervision/restart built in.
+- **Fleet's own operator access is single-deployment.** Per-Sentinel credentials are enrolled, revocable, and hash-stored, but Fleet itself has no multi-tenant SSO/RBAC for the humans operating it — it's a control plane you run yourself, not a hosted multi-tenant service.
 
 ## Non-goals (current stage)
 
