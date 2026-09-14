@@ -85,6 +85,7 @@ Fill in the PR template. CI will run automatically. If checks fail, fix them on 
 | `internal/governance/` | Risk classification and approval decisions |
 | `internal/policy/` | `airlock.yaml` config loader |
 | `internal/runmeta/` | Run manifest, digest, artifact loader |
+| `internal/fleet/` | Fleet control plane — enrollment, trust/signing, policy, session store |
 | `internal/web/` | Local HTTP evidence viewer |
 
 ## Adding an adapter

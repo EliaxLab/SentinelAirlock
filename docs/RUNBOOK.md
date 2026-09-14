@@ -137,6 +137,34 @@ Default port is `8080`. If it's already in use, pass `--port` with any free port
 airlock serve --open --port 8082
 ```
 
+## 11. Sentinel — persistent governance of a real repository
+
+```bash
+airlock sentinel --repo .                  # foreground, attached
+airlock sentinel --repo . --background     # detached, returns the terminal
+airlock sentinel --repo . --status         # is it running? what's it enforcing?
+airlock sentinel --repo . --stop           # stop it
+```
+
+Unlike `airlock run`, the writer does not need to be launched through Airlock — Sentinel watches the real repository and reacts to writes from any process (an agent, an IDE, a shell command). It is userspace detect → evaluate → revert, not kernel-level pre-write enforcement: a filesystem watcher observes mutations after the OS has already accepted them, and reverts denied ones as fast as it reasonably can. Evidence lands in the same `.airlock/runs/<session-id>/` artifact model as `airlock run`, so `airlock inspect/replay/verify <session-id>` all work against a Sentinel session with no separate inspection stack. See `airlock sentinel --help` for the full honest statement of what this does and does not guarantee, and [`docs/architecture.md`](architecture.md) for the diagram.
+
+## 12. Fleet — coordinating many Sentinels
+
+```bash
+airlock fleet init --key ./signing-key                                # create the control plane's signing key
+airlock fleet serve --listen 127.0.0.1:9090                            # start the control plane
+airlock fleet enroll-token create --fleet http://127.0.0.1:9090        # one-time token for a new Sentinel
+airlock sentinel --repo . --fleet http://127.0.0.1:9090 \
+  --fleet-enroll-token <token> --background                            # enroll a Sentinel
+airlock fleet list --fleet http://127.0.0.1:9090                       # inventory + sync state
+airlock fleet policy create production --fleet http://127.0.0.1:9090 --file policy.yaml
+airlock fleet policy assign production --fleet http://127.0.0.1:9090 --sentinel <id> --version 1
+airlock fleet sessions --fleet http://127.0.0.1:9090                   # session history across restarts
+airlock fleet revoke <id> --fleet http://127.0.0.1:9090 --reason "..." # revoke a credential
+```
+
+Fleet distributes Ed25519-signed desired-state policy and never sits in the filesystem decision path — every allow/deny is decided locally by the Sentinel watching that repo. A Sentinel keeps enforcing its last-known-good policy if Fleet is unreachable or has revoked its credential. Fleet receives coordination/status/governance metadata only, never raw repository contents or evidence. Full trust model: [`SECURITY.md`](../SECURITY.md).
+
 ## Full flow, start to finish
 
 ```bash

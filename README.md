@@ -1,8 +1,20 @@
 # Sentinel Airlock
 
-**v2.3.0-rc1** · Go 1.22 · local-first · no SaaS required
+**v2.4.0-rc1** · Go 1.22 · local-first · no SaaS required
 
-Sentinel Airlock is an agent-governance boundary for coding agents. It wraps agent execution with policy controls, writes a tamper-evident evidence trail, and gives reviewers a full set of post-run tools — inspect, replay, verify, review, export — that work entirely from recorded evidence artifacts, with no agent dependency at review time. Local-first, not a SaaS dashboard. Only captures workflows launched through Airlock.
+Sentinel Airlock lets you bring your own agents — Claude Code, Codex, OpenClaw, a shell script, an IDE, anything that writes to a repo — and governs what they do to it, with enforcement that stays local even when nothing else is reachable.
+
+It ships as four layers, each usable on its own:
+
+```
+Sentinel Airlock
+  Execution governance     airlock run        govern one execution Airlock launches
+  Persistent governance    airlock sentinel   continuously govern a repo, any writer, any process
+  Fleet governance         airlock fleet      coordinate policy across many Sentinels
+  Evidence system          inspect / replay / verify / rollback   works on any of the above
+```
+
+`airlock run` wraps one execution you launch through Airlock. `airlock sentinel` is different: it watches a real repository persistently and reacts to writes from *any* process — an agent you didn't launch through Airlock, your IDE, a shell command, another tool — without requiring that writer to integrate with Airlock at all. `airlock fleet` coordinates desired-state policy across many Sentinels from one place, but never sits in the filesystem decision path: a Sentinel keeps enforcing its last-known-good policy locally even if Fleet is down, unreachable, or has revoked that Sentinel's credential.
 
 ## Install
 
@@ -92,6 +104,82 @@ airlock serve --stop                # clean shutdown
 
 Full command-by-command walkthrough with expected output: [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
+## Sentinel — persistent governance for a real repository
+
+`airlock sentinel` continuously governs a repository instead of one execution — the writer doesn't need to be launched through Airlock at all:
+
+```
+writer / agent  (OpenClaw, Claude Code, Codex, an IDE, a shell command, anything)
+      │
+      ▼
+real repository
+      │
+      ▼
+   Sentinel  ──▶  local policy engine  ──▶  ALLOW  (preserved, recorded)
+                                       └──▶  DENY   (reverted, recorded)
+```
+
+```bash
+airlock sentinel --repo .                      # foreground, attached
+airlock sentinel --repo . --background         # detached, returns the terminal
+airlock sentinel --repo . --status             # is it running? what's it enforcing?
+airlock sentinel --repo . --stop               # stop it
+```
+
+**Honest semantics — Sentinel v1 is userspace, not kernel-level:**
+
+```
+filesystem mutation → Sentinel detects → policy evaluation
+    → ALLOW: preserved, recorded
+    → DENY:  reverted from baseline (best-effort), recorded
+```
+
+A filesystem watcher observes mutations *after the OS has already accepted them*. Best-effort filesystem governance, not mandatory access control — a process that reads a file in the narrow window before Sentinel reverts it will see the denied content. Sentinel does not prevent that; it detects, evaluates, and reverts as fast as it reasonably can, and always records what happened. Evidence lives under the same `.airlock/runs/<session-id>/` artifact model as `airlock run`, so `inspect`/`replay`/`verify` all work against a Sentinel session with no separate inspection stack. Restarting Sentinel starts a new session but never erases the history of previous ones.
+
+![Sentinel viewer: repository governance, live session activity, and session history](docs/assets/sentinel-viewer.png)
+![Session detail: governance outcome, denied writes, and next-step actions](docs/assets/session-detail.png)
+
+## Fleet — coordinating many Sentinels
+
+Fleet is a coordination and desired-state policy plane for many Sentinels. It is architecturally **not** in the filesystem decision path:
+
+```
+                     Airlock Fleet
+                  coordination/policy plane
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+          Sentinel      Sentinel      Sentinel
+              │             │             │
+            repo A        repo B        repo C
+              │             │             │
+            agents        agents        agents
+```
+
+Every filesystem allow/deny decision is made locally by the Sentinel watching that repo — never `filesystem write → remote Fleet request → allow/deny`. The invariant this enables:
+
+```
+Fleet unavailable  ≠  local governance unavailable
+```
+
+A Sentinel keeps its last-known-good policy and keeps enforcing it locally if Fleet cannot be reached, is down, or has revoked that Sentinel's credential.
+
+```bash
+airlock fleet init --key ./signing-key                    # create the control plane's policy signing key
+airlock fleet serve --listen 127.0.0.1:9090                # start the control plane
+airlock fleet enroll-token create --fleet http://127.0.0.1:9090   # one-time token for a new Sentinel
+airlock sentinel --repo . --fleet http://127.0.0.1:9090 --fleet-enroll-token <token> --background
+airlock fleet list --fleet http://127.0.0.1:9090            # inventory: identity, desired vs actual policy, sync state
+airlock fleet policy assign production --fleet http://127.0.0.1:9090 --sentinel <id> --version 1
+airlock fleet sessions --fleet http://127.0.0.1:9090         # session history across restarts, per Sentinel
+```
+
+![Fleet control plane: inventory, trust/sync state, and recent governance alerts](docs/assets/fleet-inventory.png)
+
+Fleet capabilities: Sentinel enrollment and inventory; durable machine/Sentinel/session identity; heartbeats; desired-state policy assignment, reconciliation, and drift reporting; Ed25519-signed policies with pinned signing-key verification; authenticated, revocable per-Sentinel credentials; anti-downgrade (high-water-mark) protection; local last-known-good policy; buffered metadata/status reporting across outages; and session history across restarts. Fleet enrollment is opt-in per Sentinel via `--fleet`/`--fleet-enroll-token` — a Sentinel with no `--fleet` flag runs standalone and never talks to a control plane.
+
+**What Fleet does not do:** it never receives raw repository contents, diffs, patches, or evidence — those stay on the machine that produced them (`airlock inspect/replay/verify <session-id>` reads them locally). Fleet receives coordination, status, and governance metadata only. And its trust model is precise, not absolute: a policy verifies because it's signed by a key your Sentinels pinned at enrollment — that proves the policy came from whoever holds Fleet's signing key, not that Fleet's operator is trustworthy. Protecting that signing key is your responsibility; see [`SECURITY.md`](SECURITY.md) for the full trust model.
+
 ### Try it now (self-contained, ~60 seconds)
 
 ```bash
@@ -160,6 +248,8 @@ The self-contained HTML report (`report/index.html`, no JavaScript, no network) 
 | `airlock policy list` | List available policy packs |
 | `airlock policy apply <pack>` | Write a named policy pack to `airlock.yaml` |
 | `airlock run` | Governed agent execution — produces full artifact set |
+| `airlock sentinel` | Persistent repo-level governance, independent of which process writes — `--background`/`--status`/`--stop` |
+| `airlock fleet` | Control plane: Sentinel enrollment, signed policy distribution, revocation, session history (`serve`, `list`, `policy`, `sessions`, `revoke`, `alerts`) |
 | `airlock inspect <id>` | Pretty-print run artifacts |
 | `airlock replay <id>` | Terminal event-timeline replay |
 | `airlock verify <id>` | Check digest integrity and optional signature |
@@ -310,11 +400,12 @@ Evidence / replay / verification
 
 ## Trust & Security Story
 
-- Policy deny + revert on blocked writes
+- Policy deny + revert on blocked writes (`airlock run` and `airlock sentinel` both)
 - Risk + approval metadata on events
 - Digest generation (`run_digest.json`) for tamper evidence
 - Optional signing (`run_digest.sig`) when signing key configured
 - Review state persisted as separate artifact (`review.json`)
+- Fleet: one-time enrollment tokens, opaque per-Sentinel credentials (Fleet stores only their hashes), Ed25519-signed policy with pinned signing-key verification, anti-downgrade high-water marks, explicit signed rollback grants, and revocation that never disables local enforcement
 
 ## Local vs Remote
 
@@ -328,9 +419,9 @@ See [`SECURITY.md`](SECURITY.md) and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md
 
 ## Roadmap Snapshot
 
-- V2.2 complete: packaging/operator readiness
-- Current: Phase 3 launch prep (docs/demo/release hygiene)
-- Next: first public RC + early user feedback loop
+- V2.2: packaging/operator readiness — complete
+- V2.3–V2.4: Sentinel (persistent governance) and Fleet (control plane: trust, signed policy, revocation, session history) — complete
+- Next: broader agent-adapter coverage, Fleet retention/UI polish, early user feedback loop
 
 ## Contribution / Dev
 
@@ -342,11 +433,13 @@ See [`SECURITY.md`](SECURITY.md) and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md
 ## Known Limitations / Non-Goals
 
 - **Workspace sandbox caveat:** In workspace mode, the agent process runs on the host OS. The workspace directory boundary is best-effort, not OS-enforced. Container is recommended for stronger isolation.
-- **Only captures through Airlock:** Only captures workflows launched through `airlock run`. Not a system-wide agent monitor.
+- **`airlock run` only captures what it launches.** It's a run-wrapper: workflows not launched through `airlock run` are not recorded by it. Use `airlock sentinel` to govern a repository regardless of which process writes to it.
+- **Sentinel is userspace, not kernel-level.** Detect → evaluate → revert happens after the OS has already accepted a write; a process reading in that narrow window sees the denied content before revert completes.
 - Agent backend CLIs must be installed separately; Airlock wraps them.
 - Container sandbox depends on host runtime availability (Docker/Colima/Podman) and socket access.
-- Remote auth is shared-token only — no per-user IAM at v2.3.0-rc1.
-- Airlock is **not** a hosted SaaS dashboard or control plane.
+- Remote worker auth (`airlock worker`) is shared-token only — no per-user IAM.
+- Fleet enrollment/credentials are per-Sentinel and revocable, but Fleet's own operator access is a single control-plane deployment you run yourself — no multi-tenant SSO/RBAC yet.
+- Airlock is **not** a hosted SaaS dashboard or control plane — Fleet, when used, is something you run yourself.
 - Airlock is **not** a replacement for OS-level security or network perimeter controls.
 
 ## License

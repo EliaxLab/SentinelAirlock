@@ -9,6 +9,37 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.0-rc1] — 2026-09-14
+
+### Added
+
+**Sentinel — persistent, repo-level governance**
+- `airlock sentinel --repo .` — continuously governs a real repository regardless of which process writes to it (not limited to workflows launched through `airlock run`)
+- `--background` / `--status` / `--stop` lifecycle, mirroring `airlock serve`'s pattern
+- Userspace detect → evaluate → revert model: filesystem watcher observes mutations after the OS accepts them, reverts denied ones, and records everything through the same artifact model as `airlock run` (`.airlock/runs/<session-id>/`)
+- `sandbox=off`, in-place execution against the real repo; session checkpoint taken at start
+- Sentinel status surfaced in the local viewer (`airlock serve`)
+
+**Fleet — control plane for many Sentinels**
+- `airlock fleet serve` / `init` / `list` / `status` — control plane with Sentinel enrollment and inventory
+- One-time enrollment tokens exchanged for durable, opaque per-Sentinel credentials (Fleet stores only hashes)
+- Ed25519-signed desired-state policy (`airlock fleet policy create/assign/show/update`), verified by each Sentinel against a pinned public key; full SHA-256 digest for the security check, short digest for display/drift only
+- Policy reconciliation and drift reporting; anti-downgrade high-water marks; explicit signed rollback grants
+- `airlock fleet revoke` — revokes a Sentinel's Fleet credential without stopping that Sentinel's local enforcement
+- Local last-known-good policy, re-verified (digest + signature) on every load
+- Bounded, deduplicated, buffered status/metadata reporting across Fleet outages
+- `airlock fleet sessions` / `session` — durable session history per Sentinel across restarts, with honest ACTIVE/STOPPED/INTERRUPTED status computed from facts, never fabricated
+- `airlock fleet alerts` — recent fleet-wide governance alerts
+- Fleet governance/session-history views in the local viewer
+- Architectural invariant throughout: Fleet is never in the filesystem-decision path, and Fleet unavailability never disables local Sentinel enforcement
+
+### Fixed
+- `make release-artifacts` now emits binaries named exactly as `scripts/install.sh` expects (no version segment in the filename), removing a manual rename step that previously had to happen before every release; also now emits `dist/checksums.txt`
+
+### Known Limitations
+- Sentinel is a userspace watcher, not kernel-level mandatory access control — see `airlock sentinel --help` and `SECURITY.md` for the precise detect/evaluate/revert model and its race window
+- Fleet's own operator access is single-deployment (no multi-tenant SSO/RBAC); per-Sentinel credentials are enrolled/revocable, but this is a control plane you run yourself, not a hosted service
+
 ## [2.3.0-rc1] — 2026-09-01
 
 ### Changed

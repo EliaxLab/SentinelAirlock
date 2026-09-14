@@ -19,9 +19,9 @@ Sentinel Airlock is a governance and observability layer that wraps agent execut
 - An offline-first, single-binary tool (no SaaS, no telemetry)
 
 **Is not:**
-- A hosted SaaS dashboard or control plane
+- A hosted SaaS dashboard — Fleet, when used, is a control plane you run yourself
 - A replacement for OS-level security or network perimeter controls
-- A universal agent sandbox (only captures workflows launched through Airlock)
+- Limited to workflows launched through it: `airlock run` only captures what it launches, but `airlock sentinel` governs a repository regardless of which process writes to it (see below)
 - A model provider or chat interface
 
 ---
@@ -36,6 +36,8 @@ Airlock answers three questions after every agent run:
 3. **Who reviewed it and decided it was safe?** → `review.json`
 
 These artifacts are written at run time, not assembled later. The digest makes tampering detectable.
+
+**Beyond one execution:** `airlock sentinel --repo .` runs this same policy engine persistently against a real repository, reacting to any writer (not just something launched through Airlock). `airlock fleet` coordinates signed desired-state policy across many Sentinels without ever entering the filesystem decision path — see [`docs/architecture.md`](architecture.md) and [`SECURITY.md`](../SECURITY.md) for both.
 
 ---
 
@@ -219,7 +221,8 @@ If you evaluate Airlock, these are the questions that most help:
 | Workspace sandbox caveat | In workspace mode, the agent process runs on the host OS. The workspace directory boundary is best-effort, not OS-enforced. Container mode is recommended for stronger isolation. |
 | Network enforcement | Network `off` mode in workspace sandbox records policy intent but does not block syscalls. Use container mode for enforced network isolation. |
 | Remote worker auth | Shared bearer token only. No per-user IAM, token rotation, or scoped access at this stage. |
-| Only captures through Airlock | Workflows not launched through `airlock run` are not recorded. This is a run-wrapper, not a system-wide monitor. |
+| `airlock run` scope | Workflows not launched through `airlock run` are not recorded by it — it's a run-wrapper. Use `airlock sentinel` to govern a repository regardless of which process writes to it. |
+| Sentinel is userspace | Detect → evaluate → revert happens after the OS accepts a write; not kernel-level mandatory access control. Killing the process stops enforcement with no built-in supervision. |
 | Web viewer auth | `airlock serve` has no authentication. In **operator mode** this allows UI rollback and review — only run it on `localhost`; never expose the port publicly. **Read-only mode** (`--read-only`) returns `403` on all mutating endpoints and is safe on a shared machine. |
 | Viewer process durability | The background viewer is a regular local process, not a system daemon. It survives terminal close (own process group, reparented to init) but not OS restart or `kill -9`. On unexpected exit, `viewer.pid`/`viewer.json` become stale and are auto-cleaned on the next `--status`/`--stop`/`--background` call. Logs persist in `.airlock/viewer.log`. |
 | Container runtime | Container sandbox requires Docker, Colima, or Podman. The default workspace sandbox runs without any container runtime. |
@@ -233,10 +236,11 @@ If you evaluate Airlock, these are the questions that most help:
 | Area | Status |
 |---|---|
 | Additional agent adapters (Claude Code, Codex, Ollama) | In progress |
-| IDE and Git hook enforcement | Planned |
+| Persistent, repo-level governance (`airlock sentinel`) | Shipped |
+| Fleet control plane (enrollment, signed policy, revocation, session history) | Shipped |
 | CI/CD integration (GitHub Actions, etc.) | Planned |
-| Stronger remote IAM (per-user tokens, roles) | Planned |
-| Hosted control plane | Future — not currently scoped |
+| Stronger remote worker IAM (per-user tokens, roles) | Planned |
+| Hosted (multi-tenant SaaS) control plane | Not planned — Fleet is self-deployed |
 
 ---
 
@@ -293,4 +297,4 @@ open .airlock/runs/$(ls -1t .airlock/runs | head -1)/report/index.html
 | [`SECURITY.md`](../SECURITY.md) | Sandbox model, honest guarantees and limitations |
 | [`docs/architecture.md`](architecture.md) | Execution boundary, run lifecycle, artifact model |
 | [`samples/QUICKSTART.md`](../samples/QUICKSTART.md) | Copy-paste walkthrough with expected output |
-| [`CHANGELOG.md`](../CHANGELOG.md) | What shipped in v2.2.0-rc1 |
+| [`CHANGELOG.md`](../CHANGELOG.md) | Full release history |
