@@ -19,9 +19,11 @@ install:
 
 release-artifacts:
 	mkdir -p dist
-	GOOS=darwin  GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-$(VERSION)-darwin-amd64 $(PKG)
-	GOOS=darwin  GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-$(VERSION)-darwin-arm64 $(PKG)
-	GOOS=linux   GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-$(VERSION)-linux-amd64 $(PKG)
-	GOOS=linux   GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-$(VERSION)-linux-arm64 $(PKG)
-	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-$(VERSION)-windows-amd64.exe $(PKG)
+	GOOS=darwin  GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-darwin-amd64 $(PKG)
+	GOOS=darwin  GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-darwin-arm64 $(PKG)
+	GOOS=linux   GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-linux-amd64 $(PKG)
+	GOOS=linux   GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-linux-arm64 $(PKG)
+	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/airlock-windows-amd64.exe $(PKG)
 	@printf '{\n  "version": "%s",\n  "commit": "%s",\n  "build_date": "%s"\n}\n' "$(VERSION)" "$(COMMIT)" "$(BUILD_DATE)" > dist/build_info.json
+	@cd dist && shasum -a 256 airlock-darwin-amd64 airlock-darwin-arm64 airlock-linux-amd64 airlock-linux-arm64 airlock-windows-amd64.exe > checksums.txt
+	@echo "Artifacts + checksums.txt written to dist/ — filenames match what scripts/install.sh downloads (no manual rename needed before upload)."

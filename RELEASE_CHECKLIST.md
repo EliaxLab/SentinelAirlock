@@ -13,11 +13,16 @@
 
 ## Artifacts
 - [ ] `make release-artifacts VERSION=<version>`
-- [ ] Dist files generated with expected names:
+- [ ] Dist files generated with expected names (must match `scripts/install.sh`'s download names exactly — no version segment, no manual renaming):
   - `dist/airlock-darwin-amd64`
   - `dist/airlock-darwin-arm64`
   - `dist/airlock-linux-amd64`
   - `dist/airlock-linux-arm64`
+  - `dist/airlock-windows-amd64.exe`
+  - `dist/checksums.txt`
+- [ ] Upload all five binaries + `checksums.txt` to the GitHub Release as-is (filenames already correct — do not rename)
+- [ ] Confirm `curl -fsSL .../scripts/install.sh | bash` actually downloads the new tag on at least one platform (not a source-build fallback)
+- [ ] Confirm the new tag's binary reports `airlock sentinel`/`airlock fleet` in `--help` before publishing
 
 ## Docs
 - [ ] `README.md` updated
