@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/review"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/review"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 )
 
 func TestRebuildIncludesReviewState(t *testing.T) {

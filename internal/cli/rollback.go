@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/rollback"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/rollback"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 	"github.com/spf13/cobra"
 )
 

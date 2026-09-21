@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 )
 
 // chdirTemp creates a temp dir, chdirs into it, and returns a cleanup func.

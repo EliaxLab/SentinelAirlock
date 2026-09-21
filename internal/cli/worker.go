@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/EliaxLab/SentinelAirlock/internal/remote"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 	"github.com/google/uuid"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/remote"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
 	"github.com/spf13/cobra"
 )
 

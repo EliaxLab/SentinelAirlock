@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/index"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/web"
+	"github.com/EliaxLab/SentinelAirlock/internal/index"
+	"github.com/EliaxLab/SentinelAirlock/internal/web"
 	"github.com/spf13/cobra"
 )
 

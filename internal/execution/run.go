@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/adapters"
+	"github.com/EliaxLab/SentinelAirlock/internal/adapters"
 )
 
 func Run(inv adapters.Invocation, baseEnv []string, opts Options) (int, string, error) {

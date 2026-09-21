@@ -4,7 +4,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/adapters"
+	"github.com/EliaxLab/SentinelAirlock/internal/adapters"
 )
 
 type Status string

@@ -1,6 +1,6 @@
 package main
 
-import "github.com/mirelahmed-commits/SentinelAirlock/internal/cli"
+import "github.com/EliaxLab/SentinelAirlock/internal/cli"
 
 var version = "dev"
 var commit = "none"

@@ -14,7 +14,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/fleet"
+	"github.com/EliaxLab/SentinelAirlock/internal/fleet"
 	"github.com/spf13/cobra"
 )
 

@@ -1,4 +1,4 @@
-module github.com/mirelahmed-commits/SentinelAirlock
+module github.com/EliaxLab/SentinelAirlock
 
 go 1.22
 

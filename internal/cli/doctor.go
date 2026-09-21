@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/execution"
+	"github.com/EliaxLab/SentinelAirlock/internal/execution"
 	"github.com/spf13/cobra"
 )
 

@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/execution"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/execution"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 )
 
 // chdirTempRepo creates a temp dir, chdirs into it, writes a policy allowing

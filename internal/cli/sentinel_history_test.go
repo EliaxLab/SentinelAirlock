@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/fleet"
+	"github.com/EliaxLab/SentinelAirlock/internal/fleet"
 )
 
 // serveHandler starts an httptest server for h and registers its cleanup.

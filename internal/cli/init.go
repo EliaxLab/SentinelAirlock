@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/util"
+	"github.com/EliaxLab/SentinelAirlock/internal/util"
 	"github.com/spf13/cobra"
 )
 

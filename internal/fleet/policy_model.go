@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policy"
+	"github.com/EliaxLab/SentinelAirlock/internal/policy"
 	"gopkg.in/yaml.v3"
 )
 

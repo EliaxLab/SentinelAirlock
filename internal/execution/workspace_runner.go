@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/adapters"
+	"github.com/EliaxLab/SentinelAirlock/internal/adapters"
 )
 
 func runHost(inv adapters.Invocation, env []string, opts Options) (int, string, error) {

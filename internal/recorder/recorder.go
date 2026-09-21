@@ -9,10 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/EliaxLab/SentinelAirlock/internal/events"
+	"github.com/EliaxLab/SentinelAirlock/internal/governance"
+	"github.com/EliaxLab/SentinelAirlock/internal/policy"
 	"github.com/fsnotify/fsnotify"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/events"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/governance"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policy"
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 

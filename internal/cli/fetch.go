@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/events"
+	"github.com/EliaxLab/SentinelAirlock/internal/events"
 	"github.com/spf13/cobra"
 )
 

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/fleet"
+	"github.com/EliaxLab/SentinelAirlock/internal/fleet"
 )
 
 func newTestPolicyStore(t *testing.T) *fleet.PolicyStore {

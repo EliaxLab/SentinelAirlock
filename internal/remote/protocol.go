@@ -1,6 +1,6 @@
 package remote
 
-import "github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+import "github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 
 type SandboxSettings struct {
 	Mode            string   `json:"mode"`

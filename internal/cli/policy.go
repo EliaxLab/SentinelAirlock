@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policy"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policypack"
+	"github.com/EliaxLab/SentinelAirlock/internal/policy"
+	"github.com/EliaxLab/SentinelAirlock/internal/policypack"
 	"github.com/spf13/cobra"
 )
 

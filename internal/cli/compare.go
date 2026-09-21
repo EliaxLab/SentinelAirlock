@@ -3,8 +3,8 @@ package cli
 import (
 	"fmt"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/review"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/review"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 	"github.com/spf13/cobra"
 )
 

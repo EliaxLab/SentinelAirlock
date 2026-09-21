@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/events"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/events"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 )
 
 func TestSentinelAPIInactiveWithoutLifecycleOrSessions(t *testing.T) {
