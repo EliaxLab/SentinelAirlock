@@ -10,7 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policy"
+	"github.com/EliaxLab/SentinelAirlock/internal/policy"
 	"github.com/spf13/cobra"
 )
 

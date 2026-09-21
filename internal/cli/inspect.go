@@ -3,9 +3,9 @@ package cli
 import (
 	"fmt"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/output"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/replay"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/output"
+	"github.com/EliaxLab/SentinelAirlock/internal/replay"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 	"github.com/spf13/cobra"
 )
 

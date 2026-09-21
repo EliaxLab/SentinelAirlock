@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/fleet"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policy"
+	"github.com/EliaxLab/SentinelAirlock/internal/fleet"
+	"github.com/EliaxLab/SentinelAirlock/internal/policy"
 )
 
 // Sentinel-side Fleet trust material (Prompt 14B).

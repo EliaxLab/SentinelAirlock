@@ -1,6 +1,6 @@
 package cli
 
-import "github.com/mirelahmed-commits/SentinelAirlock/internal/index"
+import "github.com/EliaxLab/SentinelAirlock/internal/index"
 
 func refreshIndex() {
 	store, err := index.Rebuild(".airlock/runs")

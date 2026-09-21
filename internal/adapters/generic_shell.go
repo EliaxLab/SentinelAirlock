@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/session"
+	"github.com/EliaxLab/SentinelAirlock/internal/session"
 )
 
 type GenericShellAdapter struct{}

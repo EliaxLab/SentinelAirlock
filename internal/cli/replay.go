@@ -8,10 +8,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/events"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/replay"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/session"
+	"github.com/EliaxLab/SentinelAirlock/internal/events"
+	"github.com/EliaxLab/SentinelAirlock/internal/replay"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/session"
 	"github.com/spf13/cobra"
 )
 

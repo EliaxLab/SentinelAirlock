@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/adapters"
+	"github.com/EliaxLab/SentinelAirlock/internal/adapters"
 )
 
 func runContainerWithRuntime(inv adapters.Invocation, baseEnv []string, opts Options, rt Runtime) (int, string, error) {

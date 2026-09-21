@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/EliaxLab/SentinelAirlock/internal/remote"
 	"github.com/google/uuid"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/remote"
 	"github.com/spf13/cobra"
 )
 

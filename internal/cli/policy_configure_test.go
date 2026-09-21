@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policy"
+	"github.com/EliaxLab/SentinelAirlock/internal/policy"
 )
 
 // helpers

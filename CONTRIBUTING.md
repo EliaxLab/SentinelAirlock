@@ -13,10 +13,10 @@ No Docker, no API keys, no network access required for the default build and tes
 ## Fork and clone
 
 ```bash
-# 1. Fork mirelahmed-commits/SentinelAirlock on GitHub, then:
+# 1. Fork EliaxLab/SentinelAirlock on GitHub, then:
 git clone https://github.com/<your-username>/SentinelAirlock.git
 cd SentinelAirlock
-git remote add upstream https://github.com/mirelahmed-commits/SentinelAirlock.git
+git remote add upstream https://github.com/EliaxLab/SentinelAirlock.git
 git fetch upstream
 ```
 
@@ -64,7 +64,7 @@ Use `fix:`, `feat:`, `docs:`, `test:`, or `refactor:` prefixes. Reference issues
 
 ## Open a PR
 
-Push your branch to **your fork** and open a PR against `mirelahmed-commits/SentinelAirlock:main`:
+Push your branch to **your fork** and open a PR against `EliaxLab/SentinelAirlock:main`:
 
 ```bash
 git push origin fix/short-description

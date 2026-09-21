@@ -12,13 +12,13 @@ reference — the one to follow when you just need the right command.
 
 ```bash
 # Option A — go install (Go 1.22+)
-go install github.com/mirelahmed-commits/SentinelAirlock/cmd/airlock@latest
+go install github.com/EliaxLab/SentinelAirlock/cmd/airlock@latest
 
 # Option B — curl installer (macOS/Linux, no Go required)
-curl -fsSL https://raw.githubusercontent.com/mirelahmed-commits/SentinelAirlock/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/EliaxLab/SentinelAirlock/main/scripts/install.sh | bash
 
 # Option C — build from source
-git clone https://github.com/mirelahmed-commits/SentinelAirlock.git
+git clone https://github.com/EliaxLab/SentinelAirlock.git
 cd SentinelAirlock
 make build      # produces ./airlock
 ```

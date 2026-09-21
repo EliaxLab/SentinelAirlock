@@ -26,12 +26,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/events"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/index"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/report"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/review"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/workspace"
+	"github.com/EliaxLab/SentinelAirlock/internal/events"
+	"github.com/EliaxLab/SentinelAirlock/internal/index"
+	"github.com/EliaxLab/SentinelAirlock/internal/report"
+	"github.com/EliaxLab/SentinelAirlock/internal/review"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/workspace"
 )
 
 // Options describes a rollback request. RunID must already be resolved to a

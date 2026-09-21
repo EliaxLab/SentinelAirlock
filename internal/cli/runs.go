@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/index"
+	"github.com/EliaxLab/SentinelAirlock/internal/index"
 	"github.com/spf13/cobra"
 )
 

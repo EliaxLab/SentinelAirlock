@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/fleet"
+	"github.com/EliaxLab/SentinelAirlock/internal/fleet"
 )
 
 func newTestFleetServer(t *testing.T) *httptest.Server {

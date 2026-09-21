@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/fleet"
+	"github.com/EliaxLab/SentinelAirlock/internal/fleet"
 )
 
 // trustFleet is a control plane with the full Prompt 14B trust machinery,

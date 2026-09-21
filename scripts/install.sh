@@ -4,7 +4,7 @@
 # Usage:
 #   bash scripts/install.sh                  # from source clone, installs to /usr/local/bin
 #   bash scripts/install.sh ~/.local/bin     # custom target dir
-#   curl -fsSL https://raw.githubusercontent.com/mirelahmed-commits/SentinelAirlock/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/EliaxLab/SentinelAirlock/main/scripts/install.sh | bash
 #
 # Behavior:
 #   1. If a prebuilt release binary exists on GitHub for the current OS/arch, download it.
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-REPO="mirelahmed-commits/SentinelAirlock"
+REPO="EliaxLab/SentinelAirlock"
 BINARY="airlock"
 VERSION="${VERSION:-latest}"
 

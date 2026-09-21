@@ -7,8 +7,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/events"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/session"
+	"github.com/EliaxLab/SentinelAirlock/internal/events"
+	"github.com/EliaxLab/SentinelAirlock/internal/session"
 )
 
 // ResolveRunID resolves "latest" to the most recently modified run directory.

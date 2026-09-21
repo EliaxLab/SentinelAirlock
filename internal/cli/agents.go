@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/agents"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policy"
+	"github.com/EliaxLab/SentinelAirlock/internal/agents"
+	"github.com/EliaxLab/SentinelAirlock/internal/policy"
 	"github.com/spf13/cobra"
 )
 

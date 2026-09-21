@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/runmeta"
+	"github.com/EliaxLab/SentinelAirlock/internal/runmeta"
 )
 
 // pollUntil retries fn every 15ms until it returns true or timeout elapses,

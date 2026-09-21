@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/events"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/governance"
-	"github.com/mirelahmed-commits/SentinelAirlock/internal/policy"
+	"github.com/EliaxLab/SentinelAirlock/internal/events"
+	"github.com/EliaxLab/SentinelAirlock/internal/governance"
+	"github.com/EliaxLab/SentinelAirlock/internal/policy"
 )
 
 // pollUntil retries fn every 10ms until it returns true or timeout elapses.
