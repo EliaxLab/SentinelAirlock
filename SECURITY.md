@@ -76,6 +76,7 @@ A filesystem watcher observes mutations *after the OS has already accepted them*
 - `sandbox=off`, in-place execution against the real `--repo` — there is no isolated workspace copy in Sentinel mode. Evidence (session checkpoint, `events.jsonl`, policy decisions) is produced the same way as `airlock run`.
 - Restarting Sentinel starts a new session but does not erase or rewrite the history of previous sessions, and does not change its durable identity when Fleet-enrolled.
 - Killing the Sentinel process (`kill -9`, OOM, etc.) stops enforcement immediately and without warning — Sentinel is a userspace watcher, not a supervised system service. There is nothing in this release that prevents a local user with permission to kill processes from doing so.
+- Sentinel combines filesystem notifications with state reconciliation: a directory created and populated fast enough that its watch could not be installed in time is reconciled against on-disk state immediately after the watch is installed, and a low-frequency safety pass repeats this for the whole tree during long-running sessions. A watcher event lost to that kind of race does not permanently escape governance — on-disk state, not event delivery, is authoritative. This does not change the detect → evaluate → revert model above or narrow the read-during-revert window; it closes a separate gap where a missed *creation* event could otherwise leave a denied file in place indefinitely.
 
 ---
 

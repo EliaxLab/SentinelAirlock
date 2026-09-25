@@ -285,6 +285,8 @@ Sentinel continuously governs a real repository instead of one execution. The wr
 
 Restarting Sentinel starts a new session (`session_id`) but keeps its durable identity (`sentinel_id`, when Fleet-enrolled) and never erases the history of earlier sessions — see the Fleet section below.
 
+**Watcher reconciliation.** fsnotify only reports a directory's own CREATE event; a writer that creates a directory and immediately populates it (a single `mkdir -p a/b/c && write a/b/c/file`, for example) can do so faster than `internal/recorder` installs a watch on each new level, and the kernel never re-delivers an event it already fired. `internal/recorder.reconcileSubtree` closes this by walking a newly-observed directory immediately after installing its watch and evaluating any file not already known to the recorder exactly as if its CREATE event had arrived, plus an infrequent (30s) full-tree safety pass for the same reason during long-running sessions. This is reconciliation against on-disk state, not a change to the detect → evaluate → revert model above — a `.env` denied inside a brand-new directory is still detected and reverted after landing on disk, just via the reconciliation path instead of (or in addition to) the direct fsnotify path when the two race.
+
 ---
 
 ## Fleet / Control Plane (`airlock fleet`)
