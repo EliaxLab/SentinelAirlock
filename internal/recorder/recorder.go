@@ -1,6 +1,7 @@
 package recorder
 
 import (
+	"bytes"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,6 +16,23 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
+
+// reconcileInterval is the period of the infrequent full-tree safety
+// reconciliation pass for long-running (debounced/Sentinel) sessions. It
+// exists to recover from fsnotify watcher loss/overflow beyond the specific
+// new-directory race that reconcileSubtree's CREATE-triggered call already
+// closes deterministically -- it is a low-frequency safety net, not the
+// primary fix, so it is intentionally infrequent rather than a poll loop.
+const reconcileInterval = 30 * time.Second
+
+// selfEventSuppressWindow is how long a path is ignored by the fsnotify event
+// loop right after the recorder itself has just accounted for it -- either by
+// reverting a denied write (the revert is itself a filesystem write that
+// would otherwise be observed and misclassified) or by evaluating a path
+// discovered through reconciliation (see reconcileSubtree) whose own,
+// legitimate fsnotify event may still be in flight and would otherwise be
+// evaluated a second time as a spurious duplicate.
+const selfEventSuppressWindow = 500 * time.Millisecond
 
 type Recorder struct {
 	root         string
@@ -142,7 +160,36 @@ func (r *Recorder) Start() error {
 
 	r.wg.Add(1)
 	go r.loop()
+
+	// The periodic safety reconciliation pass only makes sense for long-running
+	// sessions (Sentinel). airlock run's recorder lives for one short command
+	// and is already fully protected by the CREATE-triggered reconciliation in
+	// loop() -- a background ticker there would add a goroutine with nothing
+	// meaningful to do before Stop() tears it down again.
+	if r.debounce > 0 {
+		r.wg.Add(1)
+		go r.reconcileLoop()
+	}
 	return nil
+}
+
+// reconcileLoop periodically re-walks the whole tree as a low-frequency
+// safety net (see reconcileInterval's doc comment). It uses the same
+// reconcileSubtree used for the CREATE-triggered fix, so any path already
+// accounted for is a no-op -- this only ever discovers and evaluates paths
+// the watcher never reported at all.
+func (r *Recorder) reconcileLoop() {
+	defer r.wg.Done()
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-ticker.C:
+			r.reconcileSubtree(r.root)
+		}
+	}
 }
 
 func (r *Recorder) Stop() error {
@@ -163,10 +210,22 @@ func (r *Recorder) loop() {
 			if !ok {
 				return
 			}
-			// Handle new dirs to watch
+			// A newly-created directory needs more than just a watch: fsnotify
+			// only reports the CREATE for the directory entry itself, and a
+			// writer can populate it (including creating further nested
+			// directories, e.g. via MkdirAll) before this goroutine gets back
+			// around to installing that watch. Any such child event is lost
+			// permanently at the kernel level -- there is no "add a watch
+			// retroactively" that recovers an event that already happened.
+			// reconcileSubtree closes that gap: it installs watches on this
+			// directory and everything already inside it, then evaluates any
+			// file it finds that the recorder has never seen, exactly as if
+			// its own (lost) CREATE event had arrived. See recorder_test.go's
+			// TestRecorder_NewDir* suite and progress.md for the reproduction
+			// that motivated this.
 			if ev.Op&fsnotify.Create == fsnotify.Create {
 				if st, err := os.Stat(ev.Name); err == nil && st.IsDir() {
-					_ = r.w.Add(ev.Name)
+					r.reconcileSubtree(ev.Name)
 					continue
 				}
 			}
@@ -179,7 +238,22 @@ func (r *Recorder) loop() {
 				continue
 			}
 			if r.isSuppressed(rel) {
-				continue
+				// The suppression window exists to swallow the tail of an
+				// event this recorder generated itself (a revert write, or a
+				// reconciliation-discovered file's own still-in-flight real
+				// event) -- not to blindly silence *anything* touching this
+				// path for selfEventSuppressWindow. If the on-disk content no
+				// longer matches what evaluate last recorded as current, a
+				// genuinely new mutation arrived inside the window (e.g. an
+				// immediate re-write of a just-reverted denied file) and must
+				// not be dropped, so the suppression is cleared and the event
+				// is let through instead of continuing past it.
+				full := filepath.Join(r.root, filepath.FromSlash(rel))
+				current, _ := os.ReadFile(full) // empty/nil if removed, matching getLast's zero value
+				if bytes.Equal(current, r.getLast(rel)) {
+					continue
+				}
+				r.clearSuppress(rel)
 			}
 
 			// Record create/write/rename/remove for v0.
@@ -254,7 +328,7 @@ func (r *Recorder) evaluate(rel string, op fsnotify.Op) {
 		}
 
 		// revert: restore previous bytes if existed, else delete newly created file
-		r.markSuppress(rel, 500*time.Millisecond)
+		r.markSuppress(rel, selfEventSuppressWindow)
 		var revertErr error
 		if len(before) > 0 {
 			revertErr = os.WriteFile(full, before, 0o644)
@@ -329,6 +403,62 @@ func (r *Recorder) evaluate(rel string, op fsnotify.Op) {
 	})
 }
 
+// reconcileSubtree walks subtreeRoot (an absolute path -- either r.root for
+// the periodic safety pass, or a single newly-observed directory for the
+// CREATE-triggered fix), installs a watch on every directory found (idempotent
+// -- fsnotify.Add on an already-watched path is a safe no-op), and evaluates
+// every file that is not already known to the recorder exactly as if it had
+// just been created.
+//
+// "Known" is deliberately a presence check on the baseline-cache map key, not
+// on its content: a path the recorder has already evaluated at least once --
+// allowed or denied, even a zero-byte file -- has an entry in lastBytes (see
+// evaluate, which unconditionally calls setLast on both branches). A path
+// with no entry has never been evaluated by any path (normal fsnotify
+// delivery, an earlier reconciliation pass, or Seed's startup baseline), so
+// evaluating it here is exactly the "treat it as newly created" semantics
+// evaluate already implements for a real CREATE event: before-state empty,
+// after-state read from disk, policy applied, denied writes removed the same
+// way a denied real-time CREATE is removed.
+//
+// After evaluating a discovered file this way, its own legitimate fsnotify
+// event may still be sitting in the OS queue (if the race window was narrow
+// rather than a full miss) or may never arrive at all (if the window was
+// wide, as reproduced on this project's own dev machine). Either way it must
+// not be evaluated a second time, so the path is suppressed for
+// selfEventSuppressWindow the same way a self-generated revert write is --
+// reusing that exact mechanism rather than adding new state.
+func (r *Recorder) reconcileSubtree(subtreeRoot string) {
+	_ = filepath.WalkDir(subtreeRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// The path can legitimately vanish between the CREATE event firing
+			// and this walk reaching it (e.g. a rapid mkdir+rmdir). Best-effort,
+			// same as Seed/Start's initial walks.
+			return nil
+		}
+		rel := filepath.ToSlash(mustRel(r.root, path))
+		if rel == "." {
+			return nil
+		}
+		if r.shouldIgnore(rel, d.IsDir()) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			_ = r.w.Add(path)
+			return nil
+		}
+		if r.hasLast(rel) {
+			return nil // already accounted for by normal delivery or an earlier pass
+		}
+		r.evaluate(rel, fsnotify.Create)
+		r.markSuppress(rel, selfEventSuppressWindow)
+		return nil
+	})
+}
+
 func (r *Recorder) shouldIgnore(rel string, isDir bool) bool {
 	rel = strings.TrimPrefix(rel, "./")
 	// built-in ignores
@@ -374,6 +504,20 @@ func (r *Recorder) getLast(rel string) []byte {
 	return append([]byte(nil), r.lastBytes[rel]...)
 }
 
+// hasLast reports whether rel has ever been evaluated, distinct from whether
+// its cached content is empty: a zero-byte file that was legitimately
+// created still has a (nil-valued) entry in lastBytes once evaluate has run
+// for it, whereas a path the recorder has genuinely never seen has no map key
+// at all. reconcileSubtree relies on exactly that distinction to tell "never
+// observed, evaluate it now" apart from "already handled, zero-length is its
+// real content."
+func (r *Recorder) hasLast(rel string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.lastBytes[rel]
+	return ok
+}
+
 func (r *Recorder) setLast(rel string, b []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -384,6 +528,15 @@ func (r *Recorder) markSuppress(rel string, d time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.suppressUntil[rel] = time.Now().UTC().Add(d)
+}
+
+// clearSuppress ends a path's suppression window early, used when the loop
+// determines the on-disk content no longer matches what triggered the
+// suppression -- see isSuppressed's call site.
+func (r *Recorder) clearSuppress(rel string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.suppressUntil, rel)
 }
 
 func (r *Recorder) isSuppressed(rel string) bool {

@@ -110,6 +110,13 @@ it will see the denied content. Sentinel does not prevent that; it detects,
 evaluates, and reverts as fast as it reasonably can, and always records
 what happened.
 
+Sentinel combines filesystem notifications with state reconciliation, so a
+watcher event lost to a race (e.g. a directory created and populated faster
+than its watch could be installed) does not permanently escape governance:
+the next reconciliation pass evaluates it against policy as if its own event
+had arrived. Event delivery is a signal, not the source of truth -- on-disk
+state is.
+
 Lifecycle:
   airlock sentinel --repo .                      foreground, attached
   airlock sentinel --repo . --background          detached, returns the terminal

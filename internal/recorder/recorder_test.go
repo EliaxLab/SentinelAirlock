@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -419,6 +421,667 @@ func TestRecorder_RevertError_CapturedInMeta(t *testing.T) {
 	}
 }
 
+// =====================================================================
+// New-directory reconciliation: fixes the missed-child-event race where a
+// writer creates a directory and immediately writes into it before the
+// recorder's watch on that directory is installed. See recorder.go's
+// reconcileSubtree and progress.md for the reproduction that motivated this
+// (100/100 child writes missed, including 50/50 denied files surviving,
+// against the pre-fix implementation on this project's own dev machine).
+// =====================================================================
+
+// countEvents returns how many log entries exist for path -- used to assert
+// "exactly one," not just "at least one," so reconciliation's dedup
+// (selfEventSuppressWindow) is actually verified, not merely assumed.
+func countEvents(log *events.Logger, path string) int {
+	n := 0
+	for _, e := range log.EventsSnapshot() {
+		if e.Path == path {
+			n++
+		}
+	}
+	return n
+}
+
+// --- 1/2: existing directory, allowed/denied create (pre-existing coverage,
+// restated here for matrix completeness) -----------------------------------
+
+func TestRecorder_ExistingDir_AllowedCreate(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	log := newTestLogger(t, evDir)
+	rec, err := NewDebounced(root, log, denyingPolicy(), governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	target := filepath.Join(root, "src", "allowed.txt")
+	if err := os.WriteFile(target, []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool { return countEvents(log, "src/allowed.txt") >= 1 }) {
+		t.Fatal("expected an event for src/allowed.txt")
+	}
+	if b, err := os.ReadFile(target); err != nil || string(b) != "hi" {
+		t.Errorf("allowed file should survive, got %q err=%v", b, err)
+	}
+}
+
+func TestRecorder_ExistingDir_DeniedCreate(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "secrets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	log := newTestLogger(t, evDir)
+	rec, err := NewDebounced(root, log, denyingPolicy(), governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	target := filepath.Join(root, "secrets", "token.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool {
+		_, statErr := os.Stat(target)
+		return os.IsNotExist(statErr)
+	}) {
+		t.Fatal("expected denied secrets/token.txt to be removed")
+	}
+}
+
+// --- 3/4: brand-new directory, immediate allowed/denied child create ------
+
+func TestRecorder_NewDir_ImmediateAllowedChild_Converges(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	dir := filepath.Join(root, "app")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "hn-success-two.txt")
+	if err := os.WriteFile(target, []byte("created by an external writer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !pollUntil(t, 2*time.Second, func() bool { return countEvents(log, "app/hn-success-two.txt") >= 1 }) {
+		t.Fatal("expected app/hn-success-two.txt to be observed despite the new-directory race")
+	}
+	if got := countEvents(log, "app/hn-success-two.txt"); got != 1 {
+		t.Errorf("expected exactly 1 event for the reconciled file, got %d (possible duplicate)", got)
+	}
+	if b, err := os.ReadFile(target); err != nil || string(b) != "created by an external writer" {
+		t.Errorf("allowed file should survive with its real content, got %q err=%v", b, err)
+	}
+}
+
+func TestRecorder_NewDir_ImmediateDeniedChild_Reverts(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	rec, err := NewDebounced(root, log, denyingPolicy(), governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	dir := filepath.Join(root, "newsecrets")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, ".env")
+	if err := os.WriteFile(target, []byte("SECRET=1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !pollUntil(t, 2*time.Second, func() bool {
+		_, statErr := os.Stat(target)
+		return os.IsNotExist(statErr)
+	}) {
+		t.Fatal("expected denied newsecrets/.env to converge to absent despite the new-directory race")
+	}
+	if !pollUntil(t, 2*time.Second, func() bool {
+		for _, e := range log.EventsSnapshot() {
+			if e.Path == "newsecrets/.env" && e.Type == "POLICY_DENY" {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("expected a POLICY_DENY event for newsecrets/.env")
+	}
+}
+
+// --- 5/6: deep new directory tree (mkdir -p a/b/c), immediate allowed/denied
+
+func TestRecorder_DeepNewTree_ImmediateAllowedFile_Converges(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	// os.MkdirAll issues separate mkdir syscalls for a, a/b, a/b/c in sequence
+	// with no watch installed on any of them at the time -- only the CREATE
+	// for "a" (the direct child of the already-watched root) is ever fired.
+	deep := filepath.Join(root, "a", "b", "c")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(deep, "file.txt")
+	if err := os.WriteFile(target, []byte("deep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !pollUntil(t, 2*time.Second, func() bool { return countEvents(log, "a/b/c/file.txt") >= 1 }) {
+		t.Fatal("expected a/b/c/file.txt to be observed despite three levels of new directories")
+	}
+	if got := countEvents(log, "a/b/c/file.txt"); got != 1 {
+		t.Errorf("expected exactly 1 event, got %d", got)
+	}
+}
+
+func TestRecorder_DeepNewTree_ImmediateDeniedFile_Reverts(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	rec, err := NewDebounced(root, log, denyingPolicy(), governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	deep := filepath.Join(root, "secrets", "nested", "deep")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(deep, "token.txt")
+	if err := os.WriteFile(target, []byte("tok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !pollUntil(t, 2*time.Second, func() bool {
+		_, statErr := os.Stat(target)
+		return os.IsNotExist(statErr)
+	}) {
+		t.Fatal("expected denied secrets/nested/deep/token.txt to converge to absent")
+	}
+}
+
+// --- 7: multiple files created rapidly in one new directory ---------------
+
+func TestRecorder_NewDir_MultipleRapidChildren_AllConverge(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	dir := filepath.Join(root, "burst")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const n = 20
+	for i := 0; i < n; i++ {
+		if err := os.WriteFile(filepath.Join(dir, "f"+strconv.Itoa(i)+".txt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if !pollUntil(t, 2*time.Second, func() bool {
+		for i := 0; i < n; i++ {
+			if countEvents(log, "burst/f"+strconv.Itoa(i)+".txt") < 1 {
+				return false
+			}
+		}
+		return true
+	}) {
+		for i := 0; i < n; i++ {
+			if countEvents(log, "burst/f"+strconv.Itoa(i)+".txt") < 1 {
+				t.Errorf("burst/f%d.txt was never observed", i)
+			}
+		}
+		t.Fatal("not all rapidly-created files in a new directory converged")
+	}
+}
+
+// --- 8/9: allowed/denied modification in a subtree only known through
+// reconciliation (i.e. modify a file after its create was already missed and
+// recovered) ----------------------------------------------------------------
+
+func TestRecorder_ModifyAfterReconciledCreate_Allowed(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	dir := filepath.Join(root, "app2")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(target, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool { return countEvents(log, "app2/file.txt") >= 1 }) {
+		t.Fatal("expected the reconciled create to be observed first")
+	}
+
+	// Now modify it through the normal, already-watched path -- ordinary
+	// modification semantics must apply unchanged.
+	if err := os.WriteFile(target, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool {
+		b, _ := os.ReadFile(target)
+		return string(b) == "v2"
+	}) {
+		t.Fatal("expected v2 to survive as an allowed modification")
+	}
+}
+
+func TestRecorder_ModifyAfterReconciledCreate_DeniedRestoresReconciledBaseline(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	rec, err := NewDebounced(root, log, denyingPolicy(), governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	// secrets/** is denied, but the initial create still lands on disk before
+	// Sentinel evaluates it (detect->evaluate->revert) -- reconciliation must
+	// still catch it via the new-directory path, establishing "" as baseline
+	// (there was no prior legitimate content), then a further external
+	// rewrite attempt must be reverted back to that same baseline, not to the
+	// attacker-controlled content.
+	dir := filepath.Join(root, "secrets2")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "token.txt")
+	if err := os.WriteFile(target, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool {
+		_, statErr := os.Stat(target)
+		return os.IsNotExist(statErr)
+	}) {
+		t.Fatal("expected the reconciled denied create to be reverted (removed)")
+	}
+
+	// Recreate it (simulating a further denied attempt) -- must be removed
+	// again, not "restored" with any attacker content.
+	if err := os.WriteFile(target, []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool {
+		_, statErr := os.Stat(target)
+		return os.IsNotExist(statErr)
+	}) {
+		t.Fatal("expected the re-created denied file to be removed again")
+	}
+}
+
+// --- 10: delete behavior is unchanged -------------------------------------
+
+func TestRecorder_Delete_UnchangedByReconciliation(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "src", "existing.txt")
+	if err := os.WriteFile(target, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool { return countEvents(log, "src/existing.txt") >= 1 }) {
+		t.Fatal("expected a delete event for src/existing.txt")
+	}
+	for _, e := range log.EventsSnapshot() {
+		if e.Path == "src/existing.txt" {
+			if e.Type != "FILE_REMOVE" {
+				t.Errorf("expected FILE_REMOVE, got %s", e.Type)
+			}
+		}
+	}
+}
+
+// --- 11/12: .git/** and .airlock/** stay ignored even when newly created --
+
+func TestRecorder_NewGitDirectory_Ignored(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	// .git did not exist at Start() -- created fresh, exercising the same
+	// CREATE-triggered reconciliation path as any other new directory, and
+	// must still be fully ignored.
+	gitDir := filepath.Join(root, ".git", "objects")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "pack"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Positive proof the watcher/reconciler is alive and processing events.
+	if err := os.WriteFile(filepath.Join(root, "status.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pollUntil(t, 2*time.Second, func() bool { return countEvents(log, "status.txt") >= 1 })
+
+	for _, e := range log.EventsSnapshot() {
+		if strings.HasPrefix(e.Path, ".git/") || e.Path == ".git" {
+			t.Errorf(".git/** must never appear as a user mutation even when newly created, got event for %q", e.Path)
+		}
+	}
+}
+
+func TestRecorder_NewAirlockDirectory_Ignored(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	airlockDir := filepath.Join(root, ".airlock", "runs", "x")
+	if err := os.MkdirAll(airlockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(airlockDir, "events.jsonl"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "status.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pollUntil(t, 2*time.Second, func() bool { return countEvents(log, "status.txt") >= 1 })
+
+	for _, e := range log.EventsSnapshot() {
+		if strings.HasPrefix(e.Path, ".airlock/") || e.Path == ".airlock" {
+			t.Errorf(".airlock/** must never appear as a user mutation even when newly created, got event for %q", e.Path)
+		}
+	}
+}
+
+// --- 13: no duplicate evidence for a normally-observed mutation (existing,
+// already-watched directory -- no reconciliation involved at all) ----------
+
+func TestRecorder_NoDuplicateEvidence_NormalMutation(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(root, "src", "once.txt")
+	if err := os.WriteFile(target, []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool { return countEvents(log, "src/once.txt") >= 1 }) {
+		t.Fatal("expected an event for src/once.txt")
+	}
+	// Let the periodic-safety-reconciliation-adjacent machinery settle, then
+	// stop and assert no second, duplicate event ever appeared for it.
+	time.Sleep(300 * time.Millisecond)
+	_ = rec.Stop()
+
+	if got := countEvents(log, "src/once.txt"); got != 1 {
+		t.Errorf("expected exactly 1 event for a normally-observed mutation, got %d", got)
+	}
+}
+
+// --- 14: shutdown remains clean with the reconciliation goroutine running -
+
+func TestRecorder_Shutdown_CleanWithReconciliationGoroutine(t *testing.T) {
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := filepath.Join(root, "app3")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = rec.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return -- reconcileLoop goroutine may not be shutting down cleanly")
+	}
+}
+
+// --- Stress: many unique new-directory-plus-immediate-child creations, both
+// allowed and denied, must all converge with no denied file left behind ----
+
+func TestRecorder_Stress_ManyNewDirsImmediateChildren_Converge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress test skipped in -short mode")
+	}
+	root := t.TempDir()
+	evDir := t.TempDir()
+
+	log := newTestLogger(t, evDir)
+	rec, err := NewDebounced(root, log, denyingPolicy(), governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Stop()
+
+	const n = 100
+	for i := 0; i < n; i++ {
+		allowedDir := filepath.Join(root, "ok"+strconv.Itoa(i))
+		if err := os.Mkdir(allowedDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(allowedDir, "file.txt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		deniedDir := filepath.Join(root, "denied"+strconv.Itoa(i))
+		if err := os.Mkdir(deniedDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(deniedDir, ".env"), []byte("SECRET"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if !pollUntil(t, 5*time.Second, func() bool {
+		for i := 0; i < n; i++ {
+			if countEvents(log, "ok"+strconv.Itoa(i)+"/file.txt") < 1 {
+				return false
+			}
+			if _, statErr := os.Stat(filepath.Join(root, "denied"+strconv.Itoa(i), ".env")); statErr == nil {
+				return false
+			}
+		}
+		return true
+	}) {
+		missingAllowed, survivedDenied := 0, 0
+		for i := 0; i < n; i++ {
+			if countEvents(log, "ok"+strconv.Itoa(i)+"/file.txt") < 1 {
+				missingAllowed++
+			}
+			if _, statErr := os.Stat(filepath.Join(root, "denied"+strconv.Itoa(i), ".env")); statErr == nil {
+				survivedDenied++
+			}
+		}
+		t.Fatalf("stress convergence failed after %d iterations: %d allowed file(s) unobserved, %d denied file(s) survived", n, missingAllowed, survivedDenied)
+	}
+	t.Logf("stress: %d/%d allowed+denied new-dir pairs converged correctly", n, n)
+}
+
 // --- SetPolicy: live policy hot-swap (Prompt 14A Fleet reconciliation) -----
 
 func TestRecorder_SetPolicy_TakesEffectOnNextEvaluation(t *testing.T) {
@@ -475,5 +1138,55 @@ func TestRecorder_SetPolicy_TakesEffectOnNextEvaluation(t *testing.T) {
 		return string(b) == "v1\n" // reverted back to the pre-swap baseline
 	}) {
 		t.Fatal("write after SetPolicy should have been denied and reverted under the new policy")
+	}
+}
+
+// --- Benchmark: cost of a full periodic reconciliation pass on a large tree.
+// This is the steady-state cost paid every reconcileInterval by a long-running
+// Sentinel session -- the same order of work Seed() already does once at
+// startup, just repeated infrequently rather than a one-off.
+
+func BenchmarkReconcileSubtree_LargeTree(b *testing.B) {
+	root := b.TempDir()
+	const dirs, filesPerDir = 200, 25 // 5,000 files across 200 directories
+	for d := 0; d < dirs; d++ {
+		dir := filepath.Join(root, "pkg"+strconv.Itoa(d))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		for f := 0; f < filesPerDir; f++ {
+			if err := os.WriteFile(filepath.Join(dir, "file"+strconv.Itoa(f)+".go"), []byte("package pkg"), 0o644); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	evDir := b.TempDir()
+	log, err := events.NewLogger(filepath.Join(evDir, "events.jsonl"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer log.Close()
+	allowAll := &policy.Config{}
+	rec, err := NewDebounced(root, log, allowAll, governance.ApprovalAuto, 200*time.Millisecond)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := rec.Seed(); err != nil {
+		b.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		b.Fatal(err)
+	}
+	defer rec.Stop()
+
+	// Let the initial watch-installation walk settle before measuring the
+	// steady-state re-reconciliation cost (everything already known -> the
+	// realistic repeated-pass cost, not the one-off startup cost).
+	rec.reconcileSubtree(root)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rec.reconcileSubtree(root) // steady state: every path already known
 	}
 }
