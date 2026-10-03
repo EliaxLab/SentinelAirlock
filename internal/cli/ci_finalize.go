@@ -128,6 +128,13 @@ without stopping anything.`,
 				res.Verify = verifyRes
 			}
 			res.ExitCode = ciExitCodeFor(gov, nil)
+			if !cleanStop {
+				// The enforcement boundary stopped existing before finalize:
+				// writes after the crash were never governed, so this must
+				// not read as a clean result no matter what was recorded.
+				res.ExitCode = ExitCIInternalError
+				res.Error = "sentinel was not running at finalize; governance was not continuous for this session (evidence covers only the period before it stopped)"
+			}
 
 			finalizedAt := time.Now().UTC()
 			resultCopy := *res

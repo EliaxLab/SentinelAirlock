@@ -23,3 +23,9 @@
 - Lifecycle detection is PID-liveness only, so concurrent `ci start` calls on one workspace are not strictly serialized (inherited from `airlock sentinel`).
 - `.airlock/ci.json` ownership marker is a plain, non-tamper-proof file.
 - Not container, process, network, or Kubernetes security; workspace filesystem governance only. See [ci-integration.md](ci-integration.md).
+- **Detection/rollback, not prevention.** Reverting a local file does not undo an external side effect (API call, controller apply, cloud change) that already consumed it. See [ci-integration.md](ci-integration.md).
+- **No action interception.** Direct AWS/Kubernetes/API/tool actions that never touch the governed filesystem are invisible to Sentinel.
+- **Path governance only.** Forbidden content under an allowed filename passes; there is no semantic/content policy.
+- **Sentinel termination stops enforcement.** `ci exec` is fail-open on a hard kill of its own process (the child is left running); `ci finalize` after a crash returns exit 30 but is not continuous governance.
+- **Directory symlinks.** Writes that land outside the workspace through a directory symlink are not governed (and are never reverted by Sentinel).
+- **The built-in secret/auth path classifier is still substring-based for `secret` and `auth`** (e.g. `authors.md` matches). Only the `deploy` rule was narrowed: it now needs a credential/config qualifier in the same path component.

@@ -128,6 +128,9 @@ func (r *Recorder) Seed() error {
 		if d.IsDir() {
 			return nil
 		}
+		if fi, lerr := os.Lstat(path); lerr != nil || fi.Mode()&os.ModeSymlink != 0 {
+			return nil // never baseline through a symlink
+		}
 		b, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return nil
@@ -249,7 +252,7 @@ func (r *Recorder) loop() {
 				// not be dropped, so the suppression is cleared and the event
 				// is let through instead of continuing past it.
 				full := filepath.Join(r.root, filepath.FromSlash(rel))
-				current, _ := os.ReadFile(full) // empty/nil if removed, matching getLast's zero value
+				current, _ := readNoFollow(full) // empty/nil if removed, matching getLast's zero value
 				if bytes.Equal(current, r.getLast(rel)) {
 					continue
 				}
@@ -315,7 +318,7 @@ func (r *Recorder) evaluate(rel string, op fsnotify.Op) {
 	dmp := diffmatchpatch.New()
 
 	before := r.getLast(rel)
-	after, _ := os.ReadFile(full) // if removed, read fails -> empty
+	after, isLink := readNoFollow(full) // if removed, read fails -> empty; symlinks are never read through
 
 	assessment := governance.ClassifyFilesystem(rel, opName(op), r.cfg.Load())
 	approvalDecision := governance.Decide(r.approvalMode, assessment)
@@ -330,8 +333,8 @@ func (r *Recorder) evaluate(rel string, op fsnotify.Op) {
 		// revert: restore previous bytes if existed, else delete newly created file
 		r.markSuppress(rel, selfEventSuppressWindow)
 		var revertErr error
-		if len(before) > 0 {
-			revertErr = os.WriteFile(full, before, 0o644)
+		if before != nil { // existed (possibly zero bytes): restore it; nil: it did not exist
+			revertErr = restoreFile(full, before)
 		} else {
 			revertErr = os.Remove(full)
 			if os.IsNotExist(revertErr) {
@@ -351,6 +354,13 @@ func (r *Recorder) evaluate(rel string, op fsnotify.Op) {
 		meta := map[string]any{
 			"op":       op.String(),
 			"reverted": revertErr == nil,
+		}
+		if isLink {
+			if tgt, err := os.Readlink(full); err == nil {
+				meta["symlink_target"] = tgt
+			} else {
+				meta["symlink"] = true
+			}
 		}
 		if revertErr != nil {
 			meta["revert_error"] = revertErr.Error()
@@ -461,6 +471,13 @@ func (r *Recorder) reconcileSubtree(subtreeRoot string) {
 
 func (r *Recorder) shouldIgnore(rel string, isDir bool) bool {
 	rel = strings.TrimPrefix(rel, "./")
+	// A path that escapes the governed root (e.g. an event delivered through
+	// a directory symlink by a backend that follows links) is never governed:
+	// evaluating it would let a revert delete or overwrite files outside the
+	// workspace.
+	if rel == ".." || strings.HasPrefix(rel, "../") {
+		return true
+	}
 	// built-in ignores
 	if rel == ".git" || strings.HasPrefix(rel, ".git/") {
 		return true
@@ -498,10 +515,24 @@ func (r *Recorder) shouldIgnore(rel string, isDir bool) bool {
 	return false
 }
 
+// getLast returns the cached before-state for rel. nil means "the path did
+// not exist"; a non-nil (possibly zero-length) slice means it existed with
+// exactly those bytes. Callers that roll back must test `!= nil`, not
+// `len() > 0`, or an existing zero-byte file is indistinguishable from an
+// absent one and gets deleted instead of restored.
 func (r *Recorder) getLast(rel string) []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]byte(nil), r.lastBytes[rel]...)
+	return cloneKeepNil(r.lastBytes[rel])
+}
+
+// cloneKeepNil copies b, preserving the nil / empty-non-nil distinction that
+// append([]byte(nil), b...) would collapse.
+func cloneKeepNil(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append(make([]byte, 0, len(b)), b...)
 }
 
 // hasLast reports whether rel has ever been evaluated, distinct from whether
@@ -521,7 +552,7 @@ func (r *Recorder) hasLast(rel string) bool {
 func (r *Recorder) setLast(rel string, b []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.lastBytes[rel] = append([]byte(nil), b...)
+	r.lastBytes[rel] = cloneKeepNil(b)
 }
 
 func (r *Recorder) markSuppress(rel string, d time.Duration) {
@@ -589,4 +620,42 @@ func mustRel(base, path string) string {
 		return path
 	}
 	return rel
+}
+
+// readNoFollow reads the regular file at full. A symlink is never read
+// through: following it would copy the content of an arbitrary target
+// (possibly outside the workspace) into the baseline cache and the evidence
+// diff. It reports isLink so callers can record that the path is a link.
+func readNoFollow(full string) (b []byte, isLink bool) {
+	fi, err := os.Lstat(full)
+	if err != nil {
+		return nil, false
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil, true
+	}
+	b, _ = os.ReadFile(full)
+	return b, false
+}
+
+// restoreFile writes content back to full. If a symlink currently occupies
+// the path it is removed first (os.Remove never follows) and the file is
+// recreated with O_EXCL, which refuses to follow a link raced in afterwards,
+// so a rollback can never write through a link into its target.
+func restoreFile(full string, content []byte) error {
+	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(full); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return err
+		}
+		_, werr := f.Write(content)
+		if cerr := f.Close(); werr == nil {
+			werr = cerr
+		}
+		return werr
+	}
+	return os.WriteFile(full, content, 0o644)
 }
