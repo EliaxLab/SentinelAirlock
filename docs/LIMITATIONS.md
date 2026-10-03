@@ -17,3 +17,9 @@
 - Full enterprise identity/SSO/RBAC system.
 - Replacing endpoint security or network perimeter controls.
 - Becoming a model provider or chat frontend.
+
+## `airlock ci` notes
+
+- Lifecycle detection is PID-liveness only, so concurrent `ci start` calls on one workspace are not strictly serialized (inherited from `airlock sentinel`).
+- `.airlock/ci.json` ownership marker is a plain, non-tamper-proof file.
+- Not container, process, network, or Kubernetes security; workspace filesystem governance only. See [ci-integration.md](ci-integration.md).

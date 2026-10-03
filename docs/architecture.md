@@ -386,3 +386,7 @@ internal/
 ├── web/            Local HTTP evidence viewer
 └── workspace/      Repo copy/isolation
 ```
+
+## Workflow / CI integration (`airlock ci`)
+
+`airlock ci start|status|finalize` (workflow owns the workload) and `airlock ci exec -- <cmd>` (Airlock runs one child) wrap the existing Sentinel lifecycle for CI and scripts, with a documented exit-code contract (0/10/20/21/30) and `--json` output. See [ci-integration.md](ci-integration.md).

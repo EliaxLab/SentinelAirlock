@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -18,6 +19,10 @@ var rootCmd = &cobra.Command{
 func Execute() {
 	rootCmd.Version = VersionString()
 	if err := rootCmd.Execute(); err != nil {
+		var ce *ciExitError
+		if errors.As(err, &ce) {
+			os.Exit(ce.code)
+		}
 		os.Exit(1)
 	}
 }
@@ -52,4 +57,5 @@ func init() {
 	rootCmd.AddCommand(indexCmd())
 	rootCmd.AddCommand(whoamiCmd())
 	rootCmd.AddCommand(cleanupCmd())
+	rootCmd.AddCommand(ciCmd())
 }
