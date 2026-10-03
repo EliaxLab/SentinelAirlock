@@ -24,6 +24,10 @@ var (
 func useRealAirlockBinary(t *testing.T) string {
 	t.Helper()
 	ciTestBinOnce.Do(func() {
+		if p := os.Getenv("AIRLOCK_TEST_BIN"); p != "" { // prebuilt binary (e.g. cross-compiled for a Linux container with no Go toolchain)
+			ciTestBinPath = p
+			return
+		}
 		dir, err := os.MkdirTemp("", "airlock-ci-bin")
 		if err != nil {
 			ciTestBinErr = err
@@ -216,3 +220,33 @@ func TestCI_Finalize_NeverStopsUnownedSentinel(t *testing.T) {
 // ci start/finalize spawn the real airlock binary via os.Executable(), which
 // is the test binary under `go test`; that path is covered end-to-end against
 // a real built binary by samples/demo.sh instead.
+
+// A Sentinel that died before finalize means enforcement stopped. finalize
+// must report that as a lifecycle failure (exit 30), never as a clean result,
+// even though no denial was recorded.
+func TestCI_Finalize_AfterSentinelCrash_FailsClosed(t *testing.T) {
+	useRealAirlockBinary(t)
+	dir := canonicalRepo(t, chdirTempRepo(t))
+	sess, err := startSentinelSession(dir, filepath.Join(dir, "airlock.yaml"), "", false, fleetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := sess.sessionID
+	sess.shutdown() // evidence exists; no Sentinel is running any more
+
+	if err := writeCILifecycle(dir, ciLifecycle{
+		SessionID: sid, PID: 999999, Workspace: dir,
+		Owned: true, StartedAt: time.Now().UTC(), Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCI(t, "finalize", "--workspace", dir, "--json")
+	ce, ok := err.(*ciExitError)
+	if !ok || ce.code != ExitCIInternalError {
+		t.Fatalf("expected exit %d after a Sentinel crash, got %v\n%s", ExitCIInternalError, err, out)
+	}
+	res := parseCI(t, out)
+	if res.Status != "finalized_after_crash" || res.Error == "" {
+		t.Fatalf("unexpected result: status=%q error=%q", res.Status, res.Error)
+	}
+}

@@ -93,9 +93,48 @@ func touchesSensitivePath(p string) bool {
 		lp == ".ssh" || strings.HasPrefix(lp, ".ssh/") ||
 		lp == ".aws" || strings.HasPrefix(lp, ".aws/") ||
 		lp == ".git" || strings.HasPrefix(lp, ".git/") ||
-		strings.Contains(lp, "deploy") ||
+		touchesDeployCredential(lp) ||
 		strings.Contains(lp, "secret") ||
 		strings.Contains(lp, "auth")
+}
+
+// deployQualifiers are the words that, next to "deploy" in one path
+// component, mark it as deploy credentials/config (deploy_key, deploy.key,
+// deploy-token.txt, deploy_config.yaml) rather than ordinary deployment
+// material (deployment.yaml, deployments/, redeploy.sh, deploy/).
+var deployQualifiers = map[string]bool{
+	"key": true, "keys": true, "token": true, "tokens": true,
+	"credential": true, "credentials": true, "cred": true, "creds": true,
+	"secret": true, "secrets": true, "password": true, "passwd": true,
+	"config": true, "conf": true, "cfg": true, "env": true,
+	"pem": true, "rsa": true, "ssh": true, "pass": true, "passphrase": true,
+	"p12": true, "pfx": true, "kubeconfig": true,
+}
+
+// touchesDeployCredential reports whether any component of the lowercased
+// path pairs the exact word "deploy" with a qualifier from deployQualifiers.
+// Components are split on '.', '_' and '-', so "deployment", "deployments"
+// and "redeploy" never match; the glued forms "deploykey"/"deploytoken" are
+// still caught.
+func touchesDeployCredential(lp string) bool {
+	for _, comp := range strings.Split(lp, "/") {
+		tokens := strings.FieldsFunc(comp, func(r rune) bool { return r == '.' || r == '_' || r == '-' })
+		hasDeploy, hasQualifier := false, false
+		for _, tok := range tokens {
+			switch {
+			case tok == "deploy":
+				hasDeploy = true
+			case deployQualifiers[tok]:
+				hasQualifier = true
+			case strings.HasPrefix(tok, "deploy") && deployQualifiers[strings.TrimPrefix(tok, "deploy")]:
+				return true
+			}
+		}
+		if hasDeploy && hasQualifier {
+			return true
+		}
+	}
+	return false
 }
 
 func isRootConfigPath(p string) bool {

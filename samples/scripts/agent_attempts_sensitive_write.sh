@@ -5,7 +5,7 @@
 # Airlock governance outcome (with --policy-pack strict):
 #   src/output.txt       → ALLOWED   (within allow_write: src/**)
 #   .env                 → BLOCKED   (touchesSensitivePath: always HardBlocked)
-#   deploy_config.yaml   → BLOCKED   (path contains "deploy": HardBlocked)
+#   deploy_config.yaml   → BLOCKED   ("deploy" + "config" in one path component: HardBlocked)
 #
 # The blocked writes are reverted in the workspace. POLICY_DENY events are
 # recorded in events.jsonl with the attempted diff.
@@ -26,7 +26,7 @@ echo "agent output data" > src/output.txt
 # Blocked: .env is a HardBlocked sensitive path
 echo "SECRET_KEY=abc123" > .env
 
-# Blocked: path contains "deploy" — HardBlocked by governance risk classifier
+# Blocked: "deploy" paired with "config" in one path component — HardBlocked by the governance risk classifier
 echo "server: prod" > deploy_config.yaml
 
 echo "Agent attempted all writes. Airlock enforced policy on .env and deploy_config.yaml."
