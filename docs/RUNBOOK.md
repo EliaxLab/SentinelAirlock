@@ -200,3 +200,7 @@ airlock serve --stop
 This file lists real commands as of the commit that introduced it. If you add, rename, or remove a
 CLI command in `internal/cli/`, update this runbook (and the README Quick Start / CLI Reference
 table) in the same change.
+
+## Workflow / CI integration (`airlock ci`)
+
+`airlock ci start|status|finalize` (workflow owns the workload) and `airlock ci exec -- <cmd>` (Airlock runs one child) wrap the existing Sentinel lifecycle for CI and scripts, with a documented exit-code contract (0/10/20/21/30) and `--json` output. See [ci-integration.md](ci-integration.md).
