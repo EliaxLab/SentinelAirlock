@@ -2,11 +2,65 @@ package fleet
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
+
+// MinSentinelPrefix is the shortest ID prefix Resolve accepts. `fleet list`
+// displays the first 8 characters; anything shorter than this is refused so a
+// typo cannot target an unintended Sentinel.
+const MinSentinelPrefix = 4
+
+// ErrSentinelNotFound is returned when an ID matches no enrolled Sentinel.
+var ErrSentinelNotFound = errors.New("sentinel not found")
+
+// AmbiguousSentinelError is returned when a prefix matches more than one
+// enrolled Sentinel; Matches holds the full IDs so the operator can retry.
+type AmbiguousSentinelError struct {
+	Prefix  string
+	Matches []string
+}
+
+func (e *AmbiguousSentinelError) Error() string {
+	return fmt.Sprintf("sentinel ID %q is ambiguous; it matches %d sentinels (%s): use a longer prefix or the full ID",
+		e.Prefix, len(e.Matches), strings.Join(e.Matches, ", "))
+}
+
+// Resolve maps what an operator typed to the canonical SentinelID of an
+// already-enrolled Sentinel. An exact ID always wins; otherwise a prefix (at
+// least MinSentinelPrefix long, e.g. the short ID `fleet list` shows) must
+// match exactly one record. It never creates or modifies anything:
+// enrollment is the only path that creates an identity.
+func (s *Store) Resolve(idOrPrefix string) (string, error) {
+	idOrPrefix = strings.TrimSpace(idOrPrefix)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.records[idOrPrefix]; ok && idOrPrefix != "" {
+		return idOrPrefix, nil
+	}
+	if len(idOrPrefix) < MinSentinelPrefix {
+		return "", ErrSentinelNotFound
+	}
+	var matches []string
+	for id := range s.records {
+		if strings.HasPrefix(id, idOrPrefix) {
+			matches = append(matches, id)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", ErrSentinelNotFound
+	case 1:
+		return matches[0], nil
+	}
+	sort.Strings(matches)
+	return "", &AmbiguousSentinelError{Prefix: idOrPrefix, Matches: matches}
+}
 
 // Store is the control plane's durable inventory: a single JSON file
 // guarded by an in-memory mutex, following the same plain-JSON-file
@@ -106,11 +160,13 @@ func (s *Store) UpsertHeartbeat(id string, apply func(*Record)) (Record, error) 
 	return rec, nil
 }
 
-// AssignPolicy sets the desired policy ref for sentinelID (Prompt 14A). Like
-// UpsertHeartbeat, it tolerates an unknown sentinelID -- an operator may
-// reasonably want to pre-assign a policy to a Sentinel that has not enrolled
-// yet -- creating a minimal record that a future enrollment/heartbeat fills
-// in the rest of. Assigning does not touch ReconcileStatus/Error: a fresh
+// AssignPolicy sets the desired policy ref for an already-enrolled sentinelID
+// (Prompt 14A). It requires an exact, existing ID and returns
+// ErrSentinelNotFound otherwise: assignment must never create an identity (a
+// phantom OFFLINE/DRIFTED record), so callers resolve what the operator typed
+// with Resolve first. Enrollment stays the one explicit identity-creation
+// path, and a desired policy assigned to an enrolled Sentinel survives
+// re-enrollment. Assigning does not touch ReconcileStatus/Error: a fresh
 // assignment naturally reads as DRIFTED (via ReconcileState) until the
 // Sentinel next reconciles, which is the correct, honest transition.
 // digest is the full canonical digest of the assigned version and grant is an
@@ -120,9 +176,9 @@ func (s *Store) UpsertHeartbeat(id string, apply func(*Record)) (Record, error) 
 func (s *Store) AssignPolicy(sentinelID string, ref PolicyRef, digest string, grant *RollbackGrant) (Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec := s.records[sentinelID]
-	if rec.SentinelID == "" {
-		rec.SentinelID = sentinelID
+	rec, ok := s.records[sentinelID]
+	if !ok {
+		return Record{}, ErrSentinelNotFound
 	}
 	rec.DesiredPolicyID = ref.PolicyID
 	rec.DesiredPolicyVersion = ref.Version

@@ -53,6 +53,7 @@ func (hf *historyFleet) handler() http.Handler {
 // since a historyFleet runs its own server rather than trustFleet's.
 func (hf *historyFleet) assignOn(t *testing.T, baseURL, sentinelID, policyID string, version int, allowRollback bool) {
 	t.Helper()
+	seedEnrolled(t, hf.store, sentinelID)
 	body, _ := json.Marshal(map[string]any{"policy_id": policyID, "version": version, "allow_rollback": allowRollback})
 	resp, err := http.Post(baseURL+"/api/fleet/sentinels/"+sentinelID+"/assign", "application/json", bytes.NewReader(body))
 	if err != nil {

@@ -163,6 +163,8 @@ airlock fleet sessions --fleet http://127.0.0.1:9090                   # session
 airlock fleet revoke <id> --fleet http://127.0.0.1:9090 --reason "..." # revoke a credential
 ```
 
+`--sentinel` takes the full Sentinel ID or a unique prefix of at least 4 characters, such as the short ID `fleet list` displays. Assignment only targets a Sentinel that has already enrolled: an unknown ID fails with "sentinel not found", an ambiguous prefix fails with a list of the matching full IDs, and neither creates a record or changes any assignment. Enrollment is the only path that creates a Sentinel identity.
+
 Fleet distributes Ed25519-signed desired-state policy and never sits in the filesystem decision path — every allow/deny is decided locally by the Sentinel watching that repo. A Sentinel keeps enforcing its last-known-good policy if Fleet is unreachable or has revoked its credential. Fleet receives coordination/status/governance metadata only, never raw repository contents or evidence. Full trust model: [`SECURITY.md`](../SECURITY.md).
 
 ## Full flow, start to finish

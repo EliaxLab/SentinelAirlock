@@ -79,6 +79,7 @@ func (tf *trustFleet) enrollToken(t *testing.T) string {
 // assign posts a desired-policy assignment as an operator.
 func (tf *trustFleet) assign(t *testing.T, sentinelID, policyID string, version int, allowRollback bool) {
 	t.Helper()
+	seedEnrolled(t, tf.store, sentinelID)
 	body, _ := json.Marshal(map[string]any{"policy_id": policyID, "version": version, "allow_rollback": allowRollback})
 	resp, err := http.Post(tf.srv.URL+"/api/fleet/sentinels/"+sentinelID+"/assign", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -377,6 +378,7 @@ func TestSentinelTrust_DesiredHashMismatchIsRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Desired state that claims a hash the real content does not have.
+	seedEnrolled(t, tf.store, sentinelID)
 	if _, err := tf.store.AssignPolicy(sentinelID,
 		fleet.PolicyRef{PolicyID: "production", Version: v1.Version, Hash: "0000000000000000"}, v1.Digest, nil); err != nil {
 		t.Fatal(err)

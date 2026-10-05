@@ -44,8 +44,28 @@ func newTestFleetServerWithStores(t *testing.T) (*httptest.Server, *fleet.Store,
 	return srv, store, policyStore
 }
 
+// seedEnrolled makes sure sentinelID is already an enrolled identity in store.
+// Assignment never creates an identity (enrollment is the only path that
+// does), so tests that assign before the Sentinel process has started enroll
+// the record first, exactly as an operator would have had to.
+func seedEnrolled(t *testing.T, store *fleet.Store, sentinelID string) {
+	t.Helper()
+	if _, ok := store.Get(sentinelID); ok {
+		return
+	}
+	if _, err := store.UpsertEnroll(fleet.Record{SentinelID: sentinelID, MachineID: "test-seed", LastHeartbeat: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assignPolicyViaHTTP(t *testing.T, baseURL, sentinelID, policyID string, version int) {
 	t.Helper()
+	enroll, _ := json.Marshal(fleet.EnrollRequest{SentinelID: sentinelID, MachineID: "test-seed"})
+	if resp, err := http.Post(baseURL+"/api/fleet/enroll", "application/json", bytes.NewReader(enroll)); err != nil {
+		t.Fatal(err)
+	} else {
+		resp.Body.Close()
+	}
 	body, _ := json.Marshal(map[string]any{"policy_id": policyID, "version": version})
 	resp, err := http.Post(baseURL+"/api/fleet/sentinels/"+sentinelID+"/assign", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -230,6 +250,7 @@ func TestSentinel_PolicyReconciliation_HashMismatch_KeepsLastKnownGood(t *testin
 	// integrity check, not a YAML parse failure (PolicyStore's own Create/
 	// AddVersion already reject invalid YAML, so a stored version can never
 	// itself be unparsable).
+	seedEnrolled(t, store, sentinelID)
 	if _, err := store.AssignPolicy(sentinelID, fleet.PolicyRef{PolicyID: "production", Version: v1.Version, Hash: "not-the-real-hash"}, "", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -376,6 +397,7 @@ func TestSentinel_PolicyReconciliation_ResumesAfterControlPlaneRestart(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	seedEnrolled(t, store, sentinelID)
 	if _, err := store.AssignPolicy(sentinelID, fleet.PolicyRef{PolicyID: "production", Version: v1.Version, Hash: v1.Hash}, "", nil); err != nil {
 		t.Fatal(err)
 	}

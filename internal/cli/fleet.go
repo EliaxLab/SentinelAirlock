@@ -568,14 +568,18 @@ func fleetPolicyAssignCmd() *cobra.Command {
 			if err := fleetPost(fleetURL, token, path, body, &view); err != nil {
 				return err
 			}
-			fmt.Printf("Assigned %s v%d to Sentinel %s\n", args[0], version, sentinelID)
+			resolved := view.SentinelID
+			if resolved == "" {
+				resolved = sentinelID
+			}
+			fmt.Printf("Assigned %s v%d to Sentinel %s\n", args[0], version, resolved)
 			fmt.Println("It will pick this up on its next heartbeat -- no restart required.")
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&fleetURL, "fleet", "http://127.0.0.1:9090", "Fleet control plane URL")
 	cmd.Flags().StringVar(&token, "token", "", "Fleet auth token")
-	cmd.Flags().StringVar(&sentinelID, "sentinel", "", "Target Sentinel ID (see 'airlock fleet list')")
+	cmd.Flags().StringVar(&sentinelID, "sentinel", "", "Target Sentinel: full ID, or a unique prefix such as the short ID shown by 'airlock fleet list'")
 	cmd.Flags().IntVar(&version, "version", 0, "Policy version to assign")
 	return cmd
 }

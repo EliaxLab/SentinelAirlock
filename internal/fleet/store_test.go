@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -48,12 +49,14 @@ func TestStore_UpsertEnroll_PreservesOriginalEnrolledAt(t *testing.T) {
 }
 
 func TestStore_UpsertEnroll_PreservesDesiredPolicyAssignment(t *testing.T) {
-	// A desired policy may be assigned before a Sentinel has ever enrolled,
-	// or while it's offline/restarting. Re-enrolling (which happens on
-	// every Sentinel restart) must never silently clear that assignment --
-	// the enroll request has no opinion on desired state at all.
+	// A desired policy assigned to an enrolled Sentinel must survive its
+	// re-enrollment (which happens on every Sentinel restart): the enroll
+	// request has no opinion on desired state at all.
 	s, err := OpenStore(filepath.Join(t.TempDir(), "fleet.json"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertEnroll(Record{SentinelID: "sen-1", MachineID: "mach-1", LastHeartbeat: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AssignPolicy("sen-1", PolicyRef{PolicyID: "production", Version: 3, Hash: "abc"}, "", nil); err != nil {
@@ -65,6 +68,21 @@ func TestStore_UpsertEnroll_PreservesDesiredPolicyAssignment(t *testing.T) {
 	}
 	if rec.DesiredPolicyID != "production" || rec.DesiredPolicyVersion != 3 || rec.DesiredPolicyHash != "abc" {
 		t.Fatalf("enroll must not clear a pre-existing desired policy assignment, got %+v", rec)
+	}
+}
+
+// Assignment never creates an identity: an unknown ID is an error and leaves
+// the inventory untouched. Enrollment is the only identity-creation path.
+func TestStore_AssignPolicy_UnknownSentinel_FailsWithoutCreatingRecord(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "fleet.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AssignPolicy("never-enrolled", PolicyRef{PolicyID: "production", Version: 1, Hash: "h"}, "", nil); !errors.Is(err, ErrSentinelNotFound) {
+		t.Fatalf("expected ErrSentinelNotFound, got %v", err)
+	}
+	if n := len(s.List()); n != 0 {
+		t.Fatalf("a failed assignment created %d record(s)", n)
 	}
 }
 

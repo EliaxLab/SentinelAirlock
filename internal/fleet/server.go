@@ -936,6 +936,21 @@ func (s *Server) handleAssignPolicy(w http.ResponseWriter, r *http.Request, sent
 		http.Error(w, "policy_id and a positive version are required", http.StatusBadRequest)
 		return
 	}
+	// Resolve what the operator typed (full ID or the short ID `fleet list`
+	// shows) to an enrolled Sentinel before doing anything else, so an unknown
+	// or ambiguous ID fails without creating a record, issuing a grant, or
+	// changing any assignment. Everything below uses the canonical full ID.
+	sentinelID, err := s.store.Resolve(sentinelID)
+	if err != nil {
+		var amb *AmbiguousSentinelError
+		switch {
+		case errors.As(err, &amb):
+			http.Error(w, amb.Error(), http.StatusConflict)
+		default:
+			http.Error(w, "sentinel not found: no enrolled sentinel matches that ID (enroll it first; see 'airlock fleet list')", http.StatusNotFound)
+		}
+		return
+	}
 	pv, ok := s.policyStore.GetVersion(req.PolicyID, req.Version)
 	if !ok {
 		http.Error(w, fmt.Sprintf("policy %s version %d does not exist", req.PolicyID, req.Version), http.StatusNotFound)
