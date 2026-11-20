@@ -565,6 +565,7 @@ func (s *Server) handleRunPage(w http.ResponseWriter, r *http.Request) {
 
 	// Next-step guidance from observable state.
 	hasCheckpoint := len(a.Manifest.Checkpoints) > 0
+	explanations, explainOmitted := explainDecisions(runID, a.Events, hasCheckpoint, s.sentinelRollbackBlocked(a.Manifest))
 	isSentinel := a.Manifest.ExecutionMode == "sentinel"
 	inPlace := a.Manifest.Sandbox.Mode == "off"
 	activeSentinel := s.sentinelRollbackBlocked(a.Manifest)
@@ -730,6 +731,9 @@ th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border);vert
 th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
 tr.deny-row td{background:var(--bad-bg)}
 .deny-explanation{font-size:12px;color:var(--muted);font-style:italic;margin-top:3px}
+.explain-card{border:1px solid var(--border);border-left-width:4px;border-radius:8px;padding:10px 14px;margin:10px 0}
+.explain-card.ok{border-left-color:var(--ok-bd)}.explain-card.warn{border-left-color:var(--warn-bd)}.explain-card.bad{border-left-color:var(--bad-bd)}
+.explain-card p{margin:6px 0;font-size:14px;line-height:1.5}
 input,select{padding:6px 8px;border:1px solid var(--border);border-radius:7px;background:var(--panel);color:var(--text);font-size:13px}
 .caveat{font-size:12px;color:var(--muted);border-left:3px solid var(--warn-bd);padding-left:10px;margin-top:10px;line-height:1.6}
 a{color:var(--accent);text-decoration:none}
@@ -849,6 +853,24 @@ a:hover{text-decoration:underline}
     {{if .ReadOnly}}<div class="hint" style="margin-top:8px"># read-only viewer — review, rollback and export change state, so they run as terminal commands (shown in each section below)</div>{{end}}
   </div>
 </div>
+
+<!-- ── Explain this decision (template-built from recorded events; no model) ── -->
+{{if .Explanations}}
+<div class="section" id="explain">
+  <h2>What Airlock did and why</h2>
+  {{range .Explanations}}
+  <div class="explain-card {{.Class}}">
+    <span class="badge {{.Class}}">{{.Badge}}</span>
+    <p><strong>What happened:</strong> {{.What}}</p>
+    <p><strong>Why:</strong> {{.Why}}</p>
+    <p><strong>Next:</strong> {{.Next}}</p>
+    {{if .NextCommand}}<pre>{{.NextCommand}}</pre>{{end}}
+    <div class="deny-explanation">Evidence: {{.Evidence}}</div>
+  </div>
+  {{end}}
+  {{if .ExplainOmitted}}<div class="muted">…and {{.ExplainOmitted}} more — see the denied table below.</div>{{end}}
+</div>
+{{end}}
 
 <!-- ── What should I do next? ── -->
 {{if .NextStep.Headline}}
@@ -1274,6 +1296,8 @@ document.addEventListener("click",function(e){
 		"ReadOnly":           s.readOnly,
 		"Rollback":           rollbackData,
 		"DeniedItems":        deniedItems,
+		"Explanations":       explanations,
+		"ExplainOmitted":     explainOmitted,
 		"GovernanceSentence": sentence,
 		"NextStep":           ns,
 		"ReplaySummary":      replaySum,
